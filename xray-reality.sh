@@ -366,14 +366,12 @@ cmd_uninstall() {
 }
 
 _self_install() {
-  local src
-  if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
-    src="${BASH_SOURCE[0]}"
-  else
-    # Running via `bash <(curl ...)` — re-fetch if XR_SELF_URL is provided.
-    [[ -n "${XR_SELF_URL:-}" ]] || { warn "无法自我复制（脚本通过 stdin 执行且未设 XR_SELF_URL）"; return; }
-    src=$(mktemp); chmod 600 "$src"
-    curl -fsSL --proto '=https' --tlsv1.2 "$XR_SELF_URL" -o "$src" || { warn "拉取自身失败"; rm -f "$src"; return; }
+  # Works when script is run as `bash /tmp/xr.sh` (BASH_SOURCE[0] is a real file).
+  # Does not work when piped via stdin — use `curl ... -o /tmp/xr.sh && bash /tmp/xr.sh`.
+  local src="${BASH_SOURCE[0]:-}"
+  if [[ -z "$src" || ! -f "$src" ]]; then
+    warn "无法自我复制（请用 'curl ... -o /tmp/xr.sh && bash /tmp/xr.sh' 方式执行）"
+    return
   fi
   install -m 755 "$src" "$SELF_CMD"
   ok "管理命令已安装：$SELF_CMD  （以后直接运行 'xr info' / 'xr status' / 'xr update' …）"

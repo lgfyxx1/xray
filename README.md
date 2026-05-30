@@ -2,31 +2,25 @@
 
 贴近官方的 Xray VLESS-Reality 一键部署脚本。底层调用 [XTLS/Xray-install](https://github.com/XTLS/Xray-install) 官方安装器（自带 SHA256 二进制校验），支持安装后 `xr` 命令管理节点。
 
-## 一键安装
+## 一键安装（推荐）
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/lgfyxx1/xray/main/xray-reality.sh)
+curl -fsSL https://raw.githubusercontent.com/lgfyxx1/xray/main/xray-reality.sh -o /tmp/xr.sh && sudo bash /tmp/xr.sh
 ```
 
-### 加固版（推荐，先校验脚本再执行）
+> `bash <(curl ...)` 写法依赖 `/dev/fd`，部分 VPS/容器内核未挂载该路径会报错，请使用上面的下载再执行写法。
+
+### 加固版（先校验 SHA256 再执行）
 
 ```bash
-EXPECT=$(curl -fsSL https://raw.githubusercontent.com/lgfyxx1/xray/main/xray-reality.sh | sha256sum | awk '{print $1}')
 curl -fsSL https://raw.githubusercontent.com/lgfyxx1/xray/main/xray-reality.sh -o /tmp/xr.sh
-echo "$EXPECT  /tmp/xr.sh" | sha256sum -c -
+echo "$(curl -fsSL https://raw.githubusercontent.com/lgfyxx1/xray/main/xray-reality.sh | sha256sum | awk '{print $1}')  /tmp/xr.sh" | sha256sum -c -
 sudo bash /tmp/xr.sh
-```
-
-### 远程一键安装并自动注册 `xr` 管理命令
-
-```bash
-sudo XR_SELF_URL=https://raw.githubusercontent.com/lgfyxx1/xray/main/xray-reality.sh \
-  bash <(curl -fsSL https://raw.githubusercontent.com/lgfyxx1/xray/main/xray-reality.sh)
 ```
 
 ## 安装后管理
 
-安装成功后，脚本会自动把自身复制到 `/usr/local/bin/xr`，之后无需 root 查看信息：
+安装成功后脚本自动把自身复制到 `/usr/local/bin/xr`，之后随时：
 
 ```bash
 xr              # 等同于 xr info，显示节点信息 + 分享链接 + 二维码
@@ -48,7 +42,6 @@ xr uninstall    # 卸载 Xray 并清除配置
 | `XRAY_VERSION=v26.3.27` | 固定 Xray 版本（默认装最新） |
 | `XRAY_INSTALLER_SHA256=<hex>` | 钉住官方 install-release.sh SHA256（强烈建议） |
 | `FORCE=1` | 已有配置时也强制重建 |
-| `XR_SELF_URL=<url>` | 远程执行时用于自我复制的脚本 URL |
 
 ## 安全说明
 
@@ -56,8 +49,6 @@ xr uninstall    # 卸载 Xray 并清除配置
 - 全程 HTTPS + TLS 1.2+，不写 `~/.bashrc`，不安装 `jq`，不动 NTP
 - Xray 以 `nobody` 运行（官方默认），配置文件 `600` 权限
 - 分享链接中含 UUID/公钥，本地文件已设 `600`
-
-> ⚠️ `curl | bash` 链路本质上信任 GitHub + HTTPS。推荐使用加固版命令先校验脚本 SHA256 再执行。
 
 ## License
 
