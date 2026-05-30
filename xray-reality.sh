@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # xray-reality.sh — Multi-protocol Xray one-click installer
-# Protocols: VLESS+Reality, VLESS/VMess/Trojan + WS/gRPC + TLS, Shadowsocks
+# Protocols: VLESS+Reality, SS/VLESS/VMess/Trojan + WS/gRPC + TLS
 # License: MIT
 set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
 SCRIPT_NAME="xray-reality"
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.1.0"
 
 XRAY_BIN="/usr/local/bin/xray"
 SELF_CMD="/usr/local/bin/xr"
@@ -300,14 +300,22 @@ JSON
   _finalize_config
 }
 
-write_config_ss() {
+write_config_ss_ws_tls() {
   install -d -m 755 "$XRAY_CONFIG_DIR"
   cat > "$XRAY_CONFIG" <<JSON
 {
   "log":{"loglevel":"warning"},
   "inbounds":[{
     "listen":"0.0.0.0","port":${PORT},"protocol":"shadowsocks",
-    "settings":{"method":"${SS_METHOD}","password":"${PASSWORD}","network":"tcp,udp"}
+    "settings":{"method":"${SS_METHOD}","password":"${PASSWORD}","network":"tcp,udp"},
+    "streamSettings":{
+      "network":"ws","security":"tls",
+      "tlsSettings":{
+        "certificates":[{"certificateFile":"${SSL_DIR}/fullchain.pem","keyFile":"${SSL_DIR}/privkey.pem"}],
+        "minVersion":"1.2"
+      },
+      "wsSettings":{"path":"/${WS_PATH}","headers":{"Host":"${DOMAIN}"}}
+    }
   }],
 $(_common_outbounds)
 }
@@ -318,9 +326,9 @@ JSON
 _write_current_config() {
   case "$PROTO" in
     vless-reality)  write_config_reality ;;
+    ss-ws-tls)      write_config_ss_ws_tls ;;
     *-ws-tls)       write_config_ws_tls ;;
     *-grpc-tls)     write_config_grpc_tls ;;
-    shadowsocks)    write_config_ss ;;
     *) die "未知协议：$PROTO" ;;
   esac
 }
@@ -370,21 +378,23 @@ link_trojan_grpc() {
     "$PASSWORD" "$DOMAIN" "$PORT" "$DOMAIN" "$GRPC_SVC" "$(_name_enc)"
 }
 
-link_ss() {
+link_ss_ws() {
   local userinfo; userinfo=$(printf '%s:%s' "$SS_METHOD" "$PASSWORD" | base64 -w 0)
-  printf 'ss://%s@%s:%s#%s\n' "$userinfo" "$ADDR" "$PORT" "$(_name_enc)"
+  # SIP002 URI with v2ray-plugin parameters (semicolons URL-encoded as %3B)
+  local plugin="v2ray-plugin%3Bmode%3Dwebsocket%3Btls%3Bhost%3D${DOMAIN}%3Bpath%3D%2F${WS_PATH}"
+  printf 'ss://%s@%s:%s?plugin=%s#%s\n' "$userinfo" "$DOMAIN" "$PORT" "$plugin" "$(_name_enc)"
 }
 
 _build_link() {
   case "$PROTO" in
     vless-reality)   link_vless_reality ;;
+    ss-ws-tls)       link_ss_ws ;;
     vless-ws-tls)    link_vless_ws ;;
     vless-grpc-tls)  link_vless_grpc ;;
     vmess-ws-tls)    link_vmess_ws ;;
     vmess-grpc-tls)  link_vmess_grpc ;;
     trojan-ws-tls)   link_trojan_ws ;;
     trojan-grpc-tls) link_trojan_grpc ;;
-    shadowsocks)     link_ss ;;
     *)               cat "$XRAY_SHARE_FILE" 2>/dev/null ;;
   esac
 }
@@ -495,11 +505,14 @@ print_result() {
       [[ "$PROTO" == *grpc* ]] && printf "  %-10s %s\n"  "gRPC服务" "${GRPC_SVC}"
       printf "  %-10s %s\n" "TLS"    "TLS 1.2+"
       ;;
-    shadowsocks)
-      printf "  %-10s %s\n" "地址"   "${ADDR}"
+    ss-ws-tls)
+      printf "  %-10s %s\n" "域名"   "${DOMAIN}"
       printf "  %-10s %s\n" "端口"   "${PORT}"
       printf "  %-10s %s\n" "密码"   "${PASSWORD}"
       printf "  %-10s %s\n" "加密"   "${SS_METHOD}"
+      printf "  %-10s /%s\n" "路径"  "${WS_PATH}"
+      printf "  %-10s %s\n" "TLS"    "TLS 1.2+"
+      printf "  %-10s %s\n" "插件"   "v2ray-plugin (WebSocket+TLS)"
       ;;
   esac
 
@@ -522,8 +535,8 @@ select_protocol() {
   printf '%s请选择协议：%s\n' "$B" "$N"
   printf '\n%s  ─── 无需域名 ──────────────────────────────────%s\n' "$D" "$N"
   printf '  1. VLESS + TCP + Reality    %s← 推荐，最优秀的防封锁%s\n' "$G" "$N"
-  printf '  2. Shadowsocks              (兼容性广，入门首选)\n'
   printf '\n%s  ─── 需要域名 + 自动申请 TLS 证书 ──────────%s\n' "$D" "$N"
+  printf '  2. Shadowsocks + WS + TLS   (SS 隐藏于 HTTPS，防主动探测)\n'
   printf '  3. VLESS + WS  + TLS        (CDN 友好)\n'
   printf '  4. VLESS + gRPC + TLS       (CDN 友好，低延迟)\n'
   printf '  5. VMess + WS  + TLS        (兼容性最广)\n'
@@ -536,7 +549,7 @@ select_protocol() {
     read -r -p '  请输入选项 [1-8]: ' choice
     case "$choice" in
       1) printf '%s' "vless-reality";   return ;;
-      2) printf '%s' "shadowsocks";     return ;;
+      2) printf '%s' "ss-ws-tls";       return ;;
       3) printf '%s' "vless-ws-tls";    return ;;
       4) printf '%s' "vless-grpc-tls";  return ;;
       5) printf '%s' "vmess-ws-tls";    return ;;
@@ -587,6 +600,14 @@ _install_tls() {
 }
 
 _install_ss() {
+  # Domain + cert (SS traffic must be hidden in HTTPS to avoid probing)
+  DOMAIN="${XRAY_DOMAIN:-}"
+  if [[ -z "$DOMAIN" ]]; then
+    read -r -p "  请输入域名（DNS A 记录已指向本机）: " DOMAIN
+    [[ -n "$DOMAIN" ]] || die "域名不能为空"
+  fi
+  get_cert "$DOMAIN"
+
   SS_METHOD="${XRAY_SS_METHOD:-}"
   if [[ -z "$SS_METHOD" && -t 0 ]]; then
     echo
@@ -603,9 +624,9 @@ _install_ss() {
   fi
   [[ -z "$SS_METHOD" ]] && SS_METHOD="aes-256-gcm"
   PASSWORD=$(gen_password)
-  UUID=""; PRIVKEY=""; PUBKEY=""; SHORTID=""; DEST=""; SNI=""
-  DOMAIN=""; WS_PATH=""; GRPC_SVC=""
-  write_config_ss
+  WS_PATH=$(gen_path)
+  UUID=""; PRIVKEY=""; PUBKEY=""; SHORTID=""; DEST=""; SNI=""; GRPC_SVC=""
+  write_config_ss_ws_tls
 }
 
 # ─────────────────────────── Commands ───────────────────────────
@@ -624,8 +645,8 @@ cmd_install() {
 
   # Port
   case "$PROTO" in
-    *-ws-tls|*-grpc-tls) PORT="${REALITY_PORT:-443}" ;;
-    *)                    PORT=$(pick_port) ;;
+    ss-ws-tls|*-ws-tls|*-grpc-tls) PORT="${REALITY_PORT:-443}" ;;
+    *)                              PORT=$(pick_port) ;;
   esac
 
   ADDR="${REALITY_ADDR:-}"
@@ -637,9 +658,9 @@ cmd_install() {
 
   case "$PROTO" in
     vless-reality)   _install_reality ;;
+    ss-ws-tls)       _install_ss ;;
     *-ws-tls)        _install_tls "ws" ;;
     *-grpc-tls)      _install_tls "grpc" ;;
-    shadowsocks)     _install_ss ;;
     *)               die "未知协议：$PROTO" ;;
   esac
 
@@ -698,7 +719,7 @@ cmd_edit_port() {
 cmd_edit_uuid() {
   require_root; _reload_meta
   case "$PROTO" in
-    trojan-*|shadowsocks)
+    trojan-*|ss-ws-tls)
       local old="$PASSWORD"; PASSWORD=$(gen_password)
       _apply_changes; ok "密码已重新生成"
       printf "  旧：%s\n  新：%s\n" "$old" "$PASSWORD" ;;
@@ -770,8 +791,8 @@ cmd_menu() {
     printf '  1. 查看节点信息 + 二维码\n'
     printf '  2. 修改端口\n'
     case "${PROTO:-}" in
-      trojan-*|shadowsocks) printf '  3. 重新生成密码\n' ;;
-      *)                    printf '  3. 重新生成 UUID\n' ;;
+      trojan-*|ss-ws-tls) printf '  3. 重新生成密码\n' ;;
+      *)                  printf '  3. 重新生成 UUID\n' ;;
     esac
     [[ "${PROTO:-}" == "vless-reality" ]] \
       && printf '  4. 修改伪装目标 (SNI)\n' \
@@ -825,7 +846,7 @@ usage() {
 ${B}${SCRIPT_NAME} v${SCRIPT_VERSION}${N}  —  多协议 Xray 一键脚本
 
 支持协议:
-  VLESS+Reality  VLESS/VMess/Trojan + WS/gRPC + TLS  Shadowsocks
+  VLESS+Reality  SS/VLESS/VMess/Trojan + WS/gRPC + TLS（SS 走 WS+TLS 防主动探测）
 
 用法 (首次安装):
   bash $0 [install]   交互式选择协议并安装（默认）
@@ -845,7 +866,7 @@ ${B}${SCRIPT_NAME} v${SCRIPT_VERSION}${N}  —  多协议 Xray 一键脚本
   xr edit-name     修改节点名称
 
 可选环境变量:
-  PROTOCOL=vless-reality|shadowsocks|vless-ws-tls|vless-grpc-tls|
+  PROTOCOL=vless-reality|ss-ws-tls|vless-ws-tls|vless-grpc-tls|
            vmess-ws-tls|vmess-grpc-tls|trojan-ws-tls|trojan-grpc-tls
   REALITY_PORT=443       端口（TLS 协议默认 443，Reality 默认随机）
   REALITY_DEST=…         Reality 伪装目标

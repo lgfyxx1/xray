@@ -7,13 +7,15 @@
 | # | 协议 | 是否需要域名 | 特点 |
 |---|---|---|---|
 | 1 | VLESS + TCP + Reality | ❌ | **推荐**，最优秀的防封锁 |
-| 2 | Shadowsocks | ❌ | 兼容性广，入门首选 |
+| 2 | Shadowsocks + WS + TLS | ✅ | SS 隐藏于 HTTPS，防主动探测 |
 | 3 | VLESS + WS + TLS | ✅ | CDN 友好 |
 | 4 | VLESS + gRPC + TLS | ✅ | CDN 友好，低延迟 |
 | 5 | VMess + WS + TLS | ✅ | 兼容性最广 |
 | 6 | VMess + gRPC + TLS | ✅ | |
 | 7 | Trojan + WS + TLS | ✅ | |
 | 8 | Trojan + gRPC + TLS | ✅ | |
+
+> 纯明文 Shadowsocks 可被 GFW 主动探测识别。本脚本的 Shadowsocks 强制走 WebSocket+TLS，流量完全融入 HTTPS，无法被区分。
 
 TLS 协议会自动通过 **acme.sh + Let's Encrypt** 申请证书，需要：
 - 域名 DNS A 记录指向服务器 IP
