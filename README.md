@@ -1,34 +1,45 @@
 # xray-reality
 
-贴近官方的 Xray VLESS-Reality 一键部署脚本。底层调用 [XTLS/Xray-install](https://github.com/XTLS/Xray-install) 官方安装器（自带 SHA256 二进制校验），支持安装后 `xr` 命令交互式管理节点。
+多协议 Xray 一键部署脚本，底层调用 [XTLS/Xray-install](https://github.com/XTLS/Xray-install) 官方安装器。
 
-## 一键安装（推荐）
+## 支持协议
+
+| # | 协议 | 是否需要域名 | 特点 |
+|---|---|---|---|
+| 1 | VLESS + TCP + Reality | ❌ | **推荐**，最优秀的防封锁 |
+| 2 | Shadowsocks | ❌ | 兼容性广，入门首选 |
+| 3 | VLESS + WS + TLS | ✅ | CDN 友好 |
+| 4 | VLESS + gRPC + TLS | ✅ | CDN 友好，低延迟 |
+| 5 | VMess + WS + TLS | ✅ | 兼容性最广 |
+| 6 | VMess + gRPC + TLS | ✅ | |
+| 7 | Trojan + WS + TLS | ✅ | |
+| 8 | Trojan + gRPC + TLS | ✅ | |
+
+TLS 协议会自动通过 **acme.sh + Let's Encrypt** 申请证书，需要：
+- 域名 DNS A 记录指向服务器 IP
+- 80 端口空闲（申请证书时临时占用）
+
+## 一键安装
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/lgfyxx1/xray/main/xray-reality.sh -o /tmp/xr.sh && sudo bash /tmp/xr.sh
 ```
 
-> `bash <(curl ...)` 写法依赖 `/dev/fd`，部分 VPS/容器内核未挂载该路径会报错，请使用上面的下载再执行写法。
+安装时会弹出协议选择菜单。
 
-### 加固版（先校验 SHA256 再执行）
+> `bash <(curl ...)` 写法依赖 `/dev/fd`，部分 VPS 内核未挂载会报错，请使用上面的写法。
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/lgfyxx1/xray/main/xray-reality.sh -o /tmp/xr.sh
-echo "$(curl -fsSL https://raw.githubusercontent.com/lgfyxx1/xray/main/xray-reality.sh | sha256sum | awk '{print $1}')  /tmp/xr.sh" | sha256sum -c -
-sudo bash /tmp/xr.sh
-```
+## 安装后管理
 
-## 安装后管理菜单
-
-安装成功后脚本自动把自身复制到 `/usr/local/bin/xr`，直接输入 `xr` 打开管理菜单：
+安装成功后脚本自动复制到 `/usr/local/bin/xr`，输入 `xr` 打开管理菜单：
 
 ```
 ╔══════════════════════════════════════════════════╗
-║  Xray Reality 管理脚本 v1.1.0                   ║
+║  Xray 管理脚本 v2.0.0                           ║
 ╚══════════════════════════════════════════════════╝
 
-  节点：Reality-1.2.3.4   端口：43210   SNI：www.microsoft.com
-  服务状态：● 运行中
+  协议：vless-reality         端口：43210
+  地址：1.2.3.4               状态：● 运行中
 
   ─────── 节点管理 ────────────────────────────
   1. 查看节点信息 + 二维码
@@ -53,16 +64,15 @@ sudo bash /tmp/xr.sh
 
 ```bash
 xr              # 打开交互式管理菜单
-xr info         # 查看节点信息 + 分享链接 + 二维码
-xr status       # Xray 服务状态
-xr logs [N]     # 最近 N 条日志（默认 50）
-xr restart      # 重启 Xray
-xr update       # 升级 Xray 到最新稳定版
-xr uninstall    # 卸载 Xray 并清除配置
-# 直接编辑（无需进菜单）
+xr info         # 节点信息 + 分享链接 + 二维码
+xr status       # 服务状态
+xr logs [N]     # 最近 N 条日志
+xr restart      # 重启
+xr update       # 升级 Xray
+xr uninstall    # 卸载
 xr edit-port    # 修改端口
-xr edit-uuid    # 重新生成 UUID
-xr edit-dest    # 修改伪装目标 (SNI)
+xr edit-uuid    # 重新生成 UUID / 密码
+xr edit-dest    # 修改伪装目标（仅 Reality）
 xr edit-name    # 修改节点名称
 ```
 
@@ -70,20 +80,15 @@ xr edit-name    # 修改节点名称
 
 | 变量 | 说明 |
 |---|---|
-| `REALITY_PORT=443` | 指定端口（默认随机 30000-50000） |
-| `REALITY_DEST=www.apple.com` | 指定伪装目标（默认自动测速选最快） |
-| `REALITY_ADDR=1.2.3.4` | 分享链接里的服务器地址（默认自动获取公网 IP） |
-| `REALITY_NAME=MyNode` | 节点名称（默认 `Reality-<addr>`） |
-| `XRAY_VERSION=v26.3.27` | 固定 Xray 版本（默认装最新） |
-| `XRAY_INSTALLER_SHA256=<hex>` | 钉住官方 install-release.sh SHA256（强烈建议） |
-| `FORCE=1` | 已有配置时也强制重建 |
-
-## 安全说明
-
-- 底层调用 XTLS 官方 `install-release.sh`，自带 SHA256 dgst 校验二进制
-- 全程 HTTPS + TLS 1.2+，不写 `~/.bashrc`，不安装 `jq`，不动 NTP
-- Xray 以 `nobody` 运行（官方默认），配置文件 `600` 权限
-- 分享链接中含 UUID/公钥，本地文件已设 `600`
+| `PROTOCOL=vless-reality` | 跳过选择菜单，直接指定协议 |
+| `REALITY_PORT=443` | 端口（TLS 协议默认 443，Reality 默认随机） |
+| `REALITY_DEST=www.apple.com` | Reality 伪装目标 |
+| `REALITY_ADDR=1.2.3.4` | 分享链接服务器地址 |
+| `REALITY_NAME=MyNode` | 节点名称 |
+| `XRAY_DOMAIN=my.domain` | TLS 协议域名 |
+| `XRAY_SS_METHOD=aes-256-gcm` | Shadowsocks 加密方式 |
+| `XRAY_VERSION=v26.3.27` | 固定 Xray 版本 |
+| `FORCE=1` | 已有配置时强制重建 |
 
 ## License
 

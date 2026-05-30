@@ -1,17 +1,13 @@
 #!/usr/bin/env bash
-# xray-reality.sh — Lightweight, official-aligned, secure Xray VLESS-Reality one-click installer.
-#
-# Upstream installer used (with SHA256 verification):
-#   https://github.com/XTLS/Xray-install
-#
-# Goals: safer / smaller / faster / more anti-blocking / friendlier than 233boy/Xray.
+# xray-reality.sh — Multi-protocol Xray one-click installer
+# Protocols: VLESS+Reality, VLESS/VMess/Trojan + WS/gRPC + TLS, Shadowsocks
 # License: MIT
 set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
 SCRIPT_NAME="xray-reality"
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="2.0.0"
 
 XRAY_BIN="/usr/local/bin/xray"
 SELF_CMD="/usr/local/bin/xr"
@@ -19,19 +15,20 @@ XRAY_CONFIG_DIR="/usr/local/etc/xray"
 XRAY_CONFIG="${XRAY_CONFIG_DIR}/config.json"
 XRAY_SHARE_FILE="${XRAY_CONFIG_DIR}/.share.txt"
 XRAY_META_FILE="${XRAY_CONFIG_DIR}/.meta.env"
+SSL_DIR="${XRAY_CONFIG_DIR}/ssl"
+ACME_SH="$HOME/.acme.sh/acme.sh"
 
 OFFICIAL_INSTALLER_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
 
-# Curated SNI candidates — large TLS 1.3 + H2 sites known to behave well as Reality dest.
 DEFAULT_DESTS=(
-  "www.microsoft.com"
-  "addons.mozilla.org"
-  "www.lovelive-anime.jp"
-  "swdist.apple.com"
-  "www.tesla.com"
-  "gateway.icloud.com"
+  "www.microsoft.com" "addons.mozilla.org" "www.lovelive-anime.jp"
+  "swdist.apple.com"  "www.tesla.com"      "gateway.icloud.com"
   "www.cloudflare.com"
 )
+
+# Global node state — populated by _reload_meta or during install
+PROTO="" PORT="" UUID="" PASSWORD="" PRIVKEY="" PUBKEY="" SHORTID=""
+DEST="" SNI="" DOMAIN="" WS_PATH="" GRPC_SVC="" SS_METHOD="" ADDR="" NAME=""
 
 # ─────────────────────────── UI helpers ───────────────────────────
 if [[ -t 1 ]] && command -v tput >/dev/null 2>&1 && [[ $(tput colors 2>/dev/null || echo 0) -ge 8 ]]; then
@@ -47,9 +44,7 @@ die()  { err "$*"; exit 1; }
 trap 'err "脚本第 $LINENO 行异常，已中止。"' ERR
 
 # ─────────────────────────── Preflight ───────────────────────────
-require_root() {
-  [[ $EUID -eq 0 ]] || die "请使用 root 权限执行（例如：sudo bash $0 $*）"
-}
+require_root() { [[ $EUID -eq 0 ]] || die "请使用 root 权限执行（sudo bash $0 $*）"; }
 
 detect_pm() {
   if   command -v apt-get >/dev/null; then PM=apt
@@ -85,11 +80,11 @@ install_deps() {
   command -v tar      >/dev/null || pkgs+=" tar"
   if [[ -n "$pkgs" ]]; then
     msg "安装依赖：$pkgs"
-    pkg_install "$pkgs" || warn "部分依赖安装失败（如 qrencode 不影响主流程）"
+    pkg_install "$pkgs" || warn "部分依赖安装失败（qrencode 不影响主流程）"
   fi
 }
 
-# ─────────────────────────── Xray install via official script ───────────────────────────
+# ─────────────────────────── Xray core ───────────────────────────
 install_xray() {
   local tmp installer_sha
   tmp=$(mktemp); chmod 600 "$tmp"
@@ -101,15 +96,14 @@ install_xray() {
   printf '%s    %s\n' "$installer_sha" "$OFFICIAL_INSTALLER_URL" >&2
   if [[ -n "${XRAY_INSTALLER_SHA256:-}" ]]; then
     [[ "$installer_sha" == "$XRAY_INSTALLER_SHA256" ]] \
-      || { rm -f "$tmp"; die "官方安装脚本 SHA256 与 XRAY_INSTALLER_SHA256 不符（疑似中间人或上游变更）"; }
+      || { rm -f "$tmp"; die "SHA256 校验不符，疑似中间人或上游变更"; }
     ok "官方安装脚本 SHA256 校验通过"
   else
-    warn "未提供 XRAY_INSTALLER_SHA256（脚本仍走 HTTPS+二进制 dgst 校验，但你可以钉住此值进一步加固）"
+    warn "未提供 XRAY_INSTALLER_SHA256（建议钉住以加固安全）"
   fi
-  # The official installer itself SHA256-verifies the Xray-core zip via the .dgst file.
   bash "$tmp" install ${XRAY_VERSION:+--version "$XRAY_VERSION"}
   rm -f "$tmp"
-  [[ -x "$XRAY_BIN" ]] || die "Xray 安装后仍未找到 $XRAY_BIN"
+  [[ -x "$XRAY_BIN" ]] || die "Xray 安装后未找到 $XRAY_BIN"
   ok "Xray 已安装：$($XRAY_BIN version | head -n1)"
 }
 
@@ -121,10 +115,10 @@ uninstall_xray() {
   rm -f "$tmp" "$XRAY_SHARE_FILE" "$XRAY_META_FILE"
 }
 
-# ─────────────────────────── Network helpers ───────────────────────────
+# ─────────────────────────── Network / Crypto ───────────────────────────
 get_public_ip() {
-  local ip srcs_v4=(api.ipify.org ipv4.icanhazip.com ifconfig.me)
-  for s in "${srcs_v4[@]}"; do
+  local ip
+  for s in api.ipify.org ipv4.icanhazip.com ifconfig.me; do
     ip=$(curl -fsS --proto '=https' --tlsv1.2 --max-time 4 "https://${s}" 2>/dev/null | tr -d '[:space:]') || continue
     [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && { echo "$ip"; return; }
   done
@@ -137,17 +131,17 @@ get_public_ip() {
 
 pick_dest() {
   if [[ -n "${REALITY_DEST:-}" ]]; then echo "$REALITY_DEST"; return; fi
-  msg "对候选伪装目标做 TLS 握手测速…" >&2
+  msg "TLS 握手测速…" >&2
   local best="" best_ms=999999 d t ms
   for d in "${DEFAULT_DESTS[@]}"; do
     t=$(curl -o /dev/null -s -w '%{time_appconnect}' --max-time 3 --connect-timeout 2 \
         --proto '=https' --tlsv1.2 "https://${d}/" 2>/dev/null || echo 0)
     ms=$(awk -v x="$t" 'BEGIN{printf "%d", x*1000}')
-    if (( ms > 0 && ms < best_ms )); then best_ms=$ms; best=$d; fi
+    (( ms > 0 && ms < best_ms )) && { best_ms=$ms; best=$d; }
     printf "  %-28s %5d ms\n" "$d" "$ms" >&2
   done
-  [[ -z "$best" ]] && { warn "全部候选目标均不可达，回退到 www.microsoft.com"; best=www.microsoft.com; best_ms=0; }
-  ok "已选伪装目标：${best} (${best_ms} ms)" >&2
+  [[ -z "$best" ]] && { best="www.microsoft.com"; best_ms=0; }
+  ok "伪装目标：${best} (${best_ms} ms)" >&2
   echo "$best"
 }
 
@@ -158,88 +152,288 @@ pick_port() {
     p=$(( RANDOM % 20001 + 30000 ))
     ss -tlnH "sport = :$p" 2>/dev/null | grep -q . || { echo "$p"; return; }
   done
-  echo 443
+  echo 8443
 }
 
-# ─────────────────────────── Crypto material ───────────────────────────
-gen_keys() {
-  "$XRAY_BIN" x25519 | awk '
-    /[Pp]rivate.?[Kk]ey/ { priv=$NF }
-    /Public.?key|Password/ { pub=$NF }
-    END { printf "%s|%s", priv, pub }'
-}
+gen_keys()    { "$XRAY_BIN" x25519 | awk '/[Pp]rivate.?[Kk]ey/{priv=$NF}/Public.?key|Password/{pub=$NF}END{printf "%s|%s",priv,pub}'; }
 gen_shortid() { openssl rand -hex 8; }
 gen_uuid()    { "$XRAY_BIN" uuid; }
+gen_password() { openssl rand -hex 16; }
+gen_path()    { openssl rand -hex 8; }
 
-# ─────────────────────────── Config render ───────────────────────────
-write_config() {
-  local port=$1 uuid=$2 priv=$3 sid=$4 dest=$5 sni=$6
-  install -d -m 755 "$XRAY_CONFIG_DIR"
-  cat > "$XRAY_CONFIG" <<JSON
-{
-  "log": { "loglevel": "warning" },
-  "inbounds": [
-    {
-      "tag": "vless-reality",
-      "listen": "0.0.0.0",
-      "port": ${port},
-      "protocol": "vless",
-      "settings": {
-        "clients": [{ "id": "${uuid}", "flow": "xtls-rprx-vision" }],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "tcp",
-        "security": "reality",
-        "realitySettings": {
-          "show": false,
-          "dest": "${dest}:443",
-          "xver": 0,
-          "serverNames": ["${sni}"],
-          "privateKey": "${priv}",
-          "shortIds": ["${sid}"]
-        }
-      },
-      "sniffing": {
-        "enabled": true,
-        "destOverride": ["http", "tls", "quic"],
-        "routeOnly": true
-      }
-    }
-  ],
-  "outbounds": [
-    { "tag": "direct", "protocol": "freedom", "settings": { "domainStrategy": "UseIP" } },
-    { "tag": "block",  "protocol": "blackhole" }
-  ],
-  "routing": {
-    "domainStrategy": "AsIs",
-    "rules": [
-      { "type": "field", "ip": ["geoip:private"],     "outboundTag": "block" },
-      { "type": "field", "protocol": ["bittorrent"],  "outboundTag": "block" }
-    ]
-  }
+# ─────────────────────────── TLS cert (acme.sh) ───────────────────────────
+install_acme() {
+  [[ -x "$ACME_SH" ]] && return
+  msg "安装 acme.sh..."
+  curl -fsSL https://get.acme.sh | sh -s email=admin@xray.local >/dev/null 2>&1 \
+    || die "acme.sh 安装失败"
+  # Reload path
+  ACME_SH="$HOME/.acme.sh/acme.sh"
+  [[ -x "$ACME_SH" ]] || die "acme.sh 安装后未找到"
 }
+
+get_cert() {
+  local domain=$1
+  install_acme
+  mkdir -p "$SSL_DIR"
+  msg "申请 TLS 证书：$domain（Let's Encrypt standalone 模式，需要 80 端口空闲）"
+  "$ACME_SH" --issue -d "$domain" --standalone --httpport 80 \
+    --server letsencrypt --force 2>&1 \
+  || "$ACME_SH" --issue -d "$domain" --standalone --httpport 80 \
+     --server zerossl --force 2>&1 \
+  || die "证书申请失败。请确认：1) 域名 DNS A 记录指向本机 2) 80 端口未被占用"
+
+  "$ACME_SH" --install-cert -d "$domain" \
+    --key-file        "$SSL_DIR/privkey.pem" \
+    --fullchain-file  "$SSL_DIR/fullchain.pem" \
+    --reloadcmd       "systemctl restart xray" 2>&1 \
+  || die "证书安装失败"
+
+  chmod 755 "$SSL_DIR"
+  chmod 644 "$SSL_DIR/fullchain.pem"
+  chmod 600 "$SSL_DIR/privkey.pem"
+  chown nobody "$SSL_DIR/privkey.pem" 2>/dev/null || true
+  ok "证书申请完成：$domain"
+}
+
+# ─────────────────────────── Config writers (read globals) ───────────────────────────
+_common_outbounds() {
+  cat <<'JSON'
+  "outbounds":[
+    {"tag":"direct","protocol":"freedom","settings":{"domainStrategy":"UseIP"}},
+    {"tag":"block","protocol":"blackhole"}
+  ],
+  "routing":{"domainStrategy":"AsIs","rules":[
+    {"type":"field","ip":["geoip:private"],"outboundTag":"block"},
+    {"type":"field","protocol":["bittorrent"],"outboundTag":"block"}
+  ]}
 JSON
+}
+
+_finalize_config() {
   chmod 600 "$XRAY_CONFIG"
-  # Match the user the official installer runs xray as (nobody by default).
   chown nobody "$XRAY_CONFIG" 2>/dev/null || true
 }
 
-# save_meta PORT UUID PRIVKEY PUBKEY SHORTID DEST SNI ADDR NAME
+write_config_reality() {
+  install -d -m 755 "$XRAY_CONFIG_DIR"
+  cat > "$XRAY_CONFIG" <<JSON
+{
+  "log":{"loglevel":"warning"},
+  "inbounds":[{
+    "listen":"0.0.0.0","port":${PORT},"protocol":"vless",
+    "settings":{"clients":[{"id":"${UUID}","flow":"xtls-rprx-vision"}],"decryption":"none"},
+    "streamSettings":{
+      "network":"tcp","security":"reality",
+      "realitySettings":{
+        "show":false,"dest":"${DEST}:443","xver":0,
+        "serverNames":["${SNI}"],"privateKey":"${PRIVKEY}","shortIds":["${SHORTID}"]
+      }
+    },
+    "sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":true}
+  }],
+$(_common_outbounds)
+}
+JSON
+  _finalize_config
+}
+
+write_config_ws_tls() {
+  local base="${PROTO%%-ws-tls}"
+  local clients
+  case "$base" in
+    vless)  clients='"clients":[{"id":"'"$UUID"'"}],"decryption":"none"' ;;
+    vmess)  clients='"clients":[{"id":"'"$UUID"'","alterId":0}]' ;;
+    trojan) clients='"clients":[{"password":"'"$PASSWORD"'"}]' ;;
+  esac
+  install -d -m 755 "$XRAY_CONFIG_DIR"
+  cat > "$XRAY_CONFIG" <<JSON
+{
+  "log":{"loglevel":"warning"},
+  "inbounds":[{
+    "listen":"0.0.0.0","port":${PORT},"protocol":"${base}",
+    "settings":{${clients}},
+    "streamSettings":{
+      "network":"ws","security":"tls",
+      "tlsSettings":{
+        "certificates":[{"certificateFile":"${SSL_DIR}/fullchain.pem","keyFile":"${SSL_DIR}/privkey.pem"}],
+        "minVersion":"1.2"
+      },
+      "wsSettings":{"path":"/${WS_PATH}","headers":{"Host":"${DOMAIN}"}}
+    },
+    "sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":true}
+  }],
+$(_common_outbounds)
+}
+JSON
+  _finalize_config
+}
+
+write_config_grpc_tls() {
+  local base="${PROTO%%-grpc-tls}"
+  local clients
+  case "$base" in
+    vless)  clients='"clients":[{"id":"'"$UUID"'"}],"decryption":"none"' ;;
+    vmess)  clients='"clients":[{"id":"'"$UUID"'","alterId":0}]' ;;
+    trojan) clients='"clients":[{"password":"'"$PASSWORD"'"}]' ;;
+  esac
+  install -d -m 755 "$XRAY_CONFIG_DIR"
+  cat > "$XRAY_CONFIG" <<JSON
+{
+  "log":{"loglevel":"warning"},
+  "inbounds":[{
+    "listen":"0.0.0.0","port":${PORT},"protocol":"${base}",
+    "settings":{${clients}},
+    "streamSettings":{
+      "network":"grpc","security":"tls",
+      "tlsSettings":{
+        "certificates":[{"certificateFile":"${SSL_DIR}/fullchain.pem","keyFile":"${SSL_DIR}/privkey.pem"}],
+        "minVersion":"1.2"
+      },
+      "grpcSettings":{"serviceName":"${GRPC_SVC}"}
+    },
+    "sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":true}
+  }],
+$(_common_outbounds)
+}
+JSON
+  _finalize_config
+}
+
+write_config_ss() {
+  install -d -m 755 "$XRAY_CONFIG_DIR"
+  cat > "$XRAY_CONFIG" <<JSON
+{
+  "log":{"loglevel":"warning"},
+  "inbounds":[{
+    "listen":"0.0.0.0","port":${PORT},"protocol":"shadowsocks",
+    "settings":{"method":"${SS_METHOD}","password":"${PASSWORD}","network":"tcp,udp"}
+  }],
+$(_common_outbounds)
+}
+JSON
+  _finalize_config
+}
+
+_write_current_config() {
+  case "$PROTO" in
+    vless-reality)  write_config_reality ;;
+    *-ws-tls)       write_config_ws_tls ;;
+    *-grpc-tls)     write_config_grpc_tls ;;
+    shadowsocks)    write_config_ss ;;
+    *) die "未知协议：$PROTO" ;;
+  esac
+}
+
+# ─────────────────────────── Share link builders (read globals) ───────────────────────────
+_name_enc() { printf '%s' "$NAME" | tr ' ' '_'; }
+
+link_vless_reality() {
+  local host="$ADDR"; [[ "$ADDR" == *:*:* ]] && host="[$ADDR]"
+  printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&headerType=none#%s\n' \
+    "$UUID" "$host" "$PORT" "$SNI" "$PUBKEY" "$SHORTID" "$(_name_enc)"
+}
+
+link_vless_ws() {
+  printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&type=ws&host=%s&path=%%2F%s#%s\n' \
+    "$UUID" "$DOMAIN" "$PORT" "$DOMAIN" "$DOMAIN" "$WS_PATH" "$(_name_enc)"
+}
+
+link_vless_grpc() {
+  printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&type=grpc&serviceName=%s#%s\n' \
+    "$UUID" "$DOMAIN" "$PORT" "$DOMAIN" "$GRPC_SVC" "$(_name_enc)"
+}
+
+_vmess_b64() {
+  local net=$1 extra_key=$2 extra_val=$3
+  local json
+  if [[ "$net" == "ws" ]]; then
+    json=$(printf '{"v":"2","ps":"%s","add":"%s","port":"%s","id":"%s","aid":"0","scy":"auto","net":"ws","type":"none","host":"%s","path":"/%s","tls":"tls","sni":"%s","alpn":"","fp":""}' \
+      "$(_name_enc)" "$DOMAIN" "$PORT" "$UUID" "$DOMAIN" "$WS_PATH" "$DOMAIN")
+  else
+    json=$(printf '{"v":"2","ps":"%s","add":"%s","port":"%s","id":"%s","aid":"0","scy":"auto","net":"grpc","type":"gun","host":"","path":"%s","tls":"tls","sni":"%s","alpn":"","fp":""}' \
+      "$(_name_enc)" "$DOMAIN" "$PORT" "$UUID" "$GRPC_SVC" "$DOMAIN")
+  fi
+  printf 'vmess://%s\n' "$(printf '%s' "$json" | base64 -w 0)"
+}
+
+link_vmess_ws()    { _vmess_b64 ws; }
+link_vmess_grpc()  { _vmess_b64 grpc; }
+
+link_trojan_ws() {
+  printf 'trojan://%s@%s:%s?security=tls&sni=%s&type=ws&host=%s&path=%%2F%s#%s\n' \
+    "$PASSWORD" "$DOMAIN" "$PORT" "$DOMAIN" "$DOMAIN" "$WS_PATH" "$(_name_enc)"
+}
+
+link_trojan_grpc() {
+  printf 'trojan://%s@%s:%s?security=tls&sni=%s&type=grpc&serviceName=%s#%s\n' \
+    "$PASSWORD" "$DOMAIN" "$PORT" "$DOMAIN" "$GRPC_SVC" "$(_name_enc)"
+}
+
+link_ss() {
+  local userinfo; userinfo=$(printf '%s:%s' "$SS_METHOD" "$PASSWORD" | base64 -w 0)
+  printf 'ss://%s@%s:%s#%s\n' "$userinfo" "$ADDR" "$PORT" "$(_name_enc)"
+}
+
+_build_link() {
+  case "$PROTO" in
+    vless-reality)   link_vless_reality ;;
+    vless-ws-tls)    link_vless_ws ;;
+    vless-grpc-tls)  link_vless_grpc ;;
+    vmess-ws-tls)    link_vmess_ws ;;
+    vmess-grpc-tls)  link_vmess_grpc ;;
+    trojan-ws-tls)   link_trojan_ws ;;
+    trojan-grpc-tls) link_trojan_grpc ;;
+    shadowsocks)     link_ss ;;
+    *)               cat "$XRAY_SHARE_FILE" 2>/dev/null ;;
+  esac
+}
+
+# ─────────────────────────── Meta ───────────────────────────
 save_meta() {
   install -d -m 755 "$XRAY_CONFIG_DIR"
   cat > "$XRAY_META_FILE" <<EOF
-PORT=$1
-UUID=$2
-PRIVKEY=$3
-PUBKEY=$4
-SHORTID=$5
-DEST=$6
-SNI=$7
-ADDR=$8
-NAME=$9
+PROTO=${PROTO}
+PORT=${PORT}
+UUID=${UUID}
+PASSWORD=${PASSWORD}
+PRIVKEY=${PRIVKEY}
+PUBKEY=${PUBKEY}
+SHORTID=${SHORTID}
+DEST=${DEST}
+SNI=${SNI}
+DOMAIN=${DOMAIN}
+WS_PATH=${WS_PATH}
+GRPC_SVC=${GRPC_SVC}
+SS_METHOD=${SS_METHOD}
+ADDR=${ADDR}
+NAME=${NAME}
 EOF
   chmod 600 "$XRAY_META_FILE"
+}
+
+_reload_meta() {
+  [[ -r "$XRAY_META_FILE" ]] || die "未找到节点配置，请先执行安装。"
+  # shellcheck disable=SC1090
+  . "$XRAY_META_FILE"
+  [[ -z "${PROTO:-}" ]] && PROTO="vless-reality"
+  # Backward compat: old Reality installs without PRIVKEY
+  if [[ "$PROTO" == "vless-reality" && -z "${PRIVKEY:-}" ]]; then
+    PRIVKEY=$(grep '"privateKey"' "$XRAY_CONFIG" 2>/dev/null \
+              | sed 's/.*"privateKey"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+    [[ -n "$PRIVKEY" ]] || die "无法读取私钥，配置文件可能损坏"
+  fi
+}
+
+_apply_changes() {
+  _write_current_config
+  save_meta
+  local link; link=$(_build_link)
+  printf '%s\n' "$link" > "$XRAY_SHARE_FILE"; chmod 600 "$XRAY_SHARE_FILE"
+  systemctl restart xray; sleep 1
+  systemctl is-active --quiet xray \
+    && ok "Xray 已重启" \
+    || warn "Xray 重启后未运行，执行 'xr logs' 查看"
 }
 
 # ─────────────────────────── Firewall ───────────────────────────
@@ -254,38 +448,66 @@ open_firewall() {
   fi
 }
 
-# ─────────────────────────── Share link / print ───────────────────────────
-share_link() {
-  local addr=$1 port=$2 uuid=$3 pub=$4 sid=$5 sni=$6 name=$7
-  local host=$addr
-  [[ "$addr" == *:*:* ]] && host="[$addr]"   # IPv6
-  printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&headerType=none#%s\n' \
-    "$uuid" "$host" "$port" "$sni" "$pub" "$sid" "$(printf '%s' "$name" | tr ' ' '_')"
-}
-
+# ─────────────────────────── Print result ───────────────────────────
 print_result() {
-  local link=$1
+  local link="${1:-}"
+  [[ -z "$link" && -r "$XRAY_SHARE_FILE" ]] && link=$(cat "$XRAY_SHARE_FILE")
+  [[ -r "$XRAY_META_FILE" ]] && . "$XRAY_META_FILE" 2>/dev/null || true
+
   echo
-  printf '%s\n' "${G}══════════════════════════════════════════════════════════════════${N}"
-  printf '%s\n' "${G} Xray VLESS-Reality 节点信息${N}"
-  printf '%s\n' "${G}══════════════════════════════════════════════════════════════════${N}"
-  if [[ -r "$XRAY_META_FILE" ]]; then
-    # shellcheck disable=SC1090
-    . "$XRAY_META_FILE"
-    printf "  %-9s %s\n" "地址"   "${ADDR:-}"
-    printf "  %-9s %s\n" "端口"   "${PORT:-}"
-    printf "  %-9s %s\n" "UUID"   "${UUID:-}"
-    printf "  %-9s %s\n" "公钥"   "${PUBKEY:-}"
-    printf "  %-9s %s\n" "短 ID"  "${SHORTID:-}"
-    printf "  %-9s %s\n" "SNI"    "${SNI:-}"
-    printf "  %-9s %s\n" "Flow"   "xtls-rprx-vision"
-    printf "  %-9s %s\n" "指纹"   "chrome"
-    echo
-  fi
-  printf '%s\n' "${B}── 分享链接 ─────────────────────────────────────────────────────${N}"
+  printf '%s══════════════════════════════════════════════════════════════════%s\n' "$G" "$N"
+  printf '%s Xray 节点信息  %s%s\n' "$G" "${PROTO:-}" "$N"
+  printf '%s══════════════════════════════════════════════════════════════════%s\n' "$G" "$N"
+
+  case "${PROTO:-vless-reality}" in
+    vless-reality)
+      printf "  %-10s %s\n" "地址"   "${ADDR}"
+      printf "  %-10s %s\n" "端口"   "${PORT}"
+      printf "  %-10s %s\n" "UUID"   "${UUID}"
+      printf "  %-10s %s\n" "公钥"   "${PUBKEY}"
+      printf "  %-10s %s\n" "短 ID"  "${SHORTID}"
+      printf "  %-10s %s\n" "SNI"    "${SNI}"
+      printf "  %-10s %s\n" "Flow"   "xtls-rprx-vision"
+      printf "  %-10s %s\n" "指纹"   "chrome"
+      ;;
+    vless-ws-tls|vless-grpc-tls)
+      printf "  %-10s %s\n" "域名"   "${DOMAIN}"
+      printf "  %-10s %s\n" "端口"   "${PORT}"
+      printf "  %-10s %s\n" "UUID"   "${UUID}"
+      [[ "$PROTO" == *ws* ]]   && printf "  %-10s /%s\n" "路径"     "${WS_PATH}"
+      [[ "$PROTO" == *grpc* ]] && printf "  %-10s %s\n"  "gRPC服务" "${GRPC_SVC}"
+      printf "  %-10s %s\n" "TLS"    "TLS 1.2+"
+      ;;
+    vmess-ws-tls|vmess-grpc-tls)
+      printf "  %-10s %s\n" "域名"   "${DOMAIN}"
+      printf "  %-10s %s\n" "端口"   "${PORT}"
+      printf "  %-10s %s\n" "UUID"   "${UUID}"
+      printf "  %-10s %s\n" "alterID" "0"
+      [[ "$PROTO" == *ws* ]]   && printf "  %-10s /%s\n" "路径"     "${WS_PATH}"
+      [[ "$PROTO" == *grpc* ]] && printf "  %-10s %s\n"  "gRPC服务" "${GRPC_SVC}"
+      printf "  %-10s %s\n" "TLS"    "TLS 1.2+"
+      ;;
+    trojan-ws-tls|trojan-grpc-tls)
+      printf "  %-10s %s\n" "域名"   "${DOMAIN}"
+      printf "  %-10s %s\n" "端口"   "${PORT}"
+      printf "  %-10s %s\n" "密码"   "${PASSWORD}"
+      [[ "$PROTO" == *ws* ]]   && printf "  %-10s /%s\n" "路径"     "${WS_PATH}"
+      [[ "$PROTO" == *grpc* ]] && printf "  %-10s %s\n"  "gRPC服务" "${GRPC_SVC}"
+      printf "  %-10s %s\n" "TLS"    "TLS 1.2+"
+      ;;
+    shadowsocks)
+      printf "  %-10s %s\n" "地址"   "${ADDR}"
+      printf "  %-10s %s\n" "端口"   "${PORT}"
+      printf "  %-10s %s\n" "密码"   "${PASSWORD}"
+      printf "  %-10s %s\n" "加密"   "${SS_METHOD}"
+      ;;
+  esac
+
+  echo
+  printf '%s── 分享链接 ────────────────────────────────────────────────────%s\n' "$B" "$N"
   printf '%s\n' "$link"
   echo
-  printf '%s\n' "${B}── 二维码 ───────────────────────────────────────────────────────${N}"
+  printf '%s── 二维码 ──────────────────────────────────────────────────────%s\n' "$B" "$N"
   if command -v qrencode >/dev/null; then
     qrencode -t ANSIUTF8 -m 2 "$link"
   else
@@ -294,105 +516,165 @@ print_result() {
   printf '%s分享链接已保存至：%s%s\n' "$D" "$XRAY_SHARE_FILE" "$N"
 }
 
-# ─────────────────────────── Meta helpers ───────────────────────────
-_reload_meta() {
-  [[ -r "$XRAY_META_FILE" ]] || die "未找到节点配置（$XRAY_META_FILE），请先执行安装。"
-  # shellcheck disable=SC1090
-  . "$XRAY_META_FILE"
-  # Backward compat: old meta files lack PRIVKEY; extract from config.json.
-  if [[ -z "${PRIVKEY:-}" ]]; then
-    PRIVKEY=$(grep '"privateKey"' "$XRAY_CONFIG" 2>/dev/null \
-              | sed 's/.*"privateKey"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
-    [[ -n "$PRIVKEY" ]] || die "无法读取私钥，配置文件可能损坏"
-  fi
+# ─────────────────────────── Protocol selection ───────────────────────────
+select_protocol() {
+  echo
+  printf '%s请选择协议：%s\n' "$B" "$N"
+  printf '\n%s  ─── 无需域名 ──────────────────────────────────%s\n' "$D" "$N"
+  printf '  1. VLESS + TCP + Reality    %s← 推荐，最优秀的防封锁%s\n' "$G" "$N"
+  printf '  2. Shadowsocks              (兼容性广，入门首选)\n'
+  printf '\n%s  ─── 需要域名 + 自动申请 TLS 证书 ──────────%s\n' "$D" "$N"
+  printf '  3. VLESS + WS  + TLS        (CDN 友好)\n'
+  printf '  4. VLESS + gRPC + TLS       (CDN 友好，低延迟)\n'
+  printf '  5. VMess + WS  + TLS        (兼容性最广)\n'
+  printf '  6. VMess + gRPC + TLS\n'
+  printf '  7. Trojan + WS  + TLS\n'
+  printf '  8. Trojan + gRPC + TLS\n'
+  echo
+  local choice
+  while true; do
+    read -r -p '  请输入选项 [1-8]: ' choice
+    case "$choice" in
+      1) printf '%s' "vless-reality";   return ;;
+      2) printf '%s' "shadowsocks";     return ;;
+      3) printf '%s' "vless-ws-tls";    return ;;
+      4) printf '%s' "vless-grpc-tls";  return ;;
+      5) printf '%s' "vmess-ws-tls";    return ;;
+      6) printf '%s' "vmess-grpc-tls";  return ;;
+      7) printf '%s' "trojan-ws-tls";   return ;;
+      8) printf '%s' "trojan-grpc-tls"; return ;;
+      *) warn "请输入 1-8" ;;
+    esac
+  done
 }
 
-_apply_changes() {
-  write_config "$PORT" "$UUID" "$PRIVKEY" "$SHORTID" "$DEST" "$SNI"
-  save_meta "$PORT" "$UUID" "$PRIVKEY" "$PUBKEY" "$SHORTID" "$DEST" "$SNI" "$ADDR" "$NAME"
-  local link; link=$(share_link "$ADDR" "$PORT" "$UUID" "$PUBKEY" "$SHORTID" "$SNI" "$NAME")
-  printf '%s\n' "$link" > "$XRAY_SHARE_FILE"; chmod 600 "$XRAY_SHARE_FILE"
-  systemctl restart xray
-  sleep 1
-  systemctl is-active --quiet xray \
-    && ok "Xray 已重启" \
-    || warn "Xray 重启后未运行，请执行 'xr logs' 查看日志"
+# ─────────────────────────── Install sub-flows ───────────────────────────
+_install_reality() {
+  UUID=$(gen_uuid)
+  local keys; keys=$(gen_keys)
+  PRIVKEY="${keys%|*}"; PUBKEY="${keys#*|}"
+  [[ -n "$PRIVKEY" && -n "$PUBKEY" ]] || die "解析 xray x25519 输出失败"
+  SHORTID=$(gen_shortid)
+  DEST="${REALITY_DEST:-$(pick_dest)}"
+  SNI="$DEST"
+  DOMAIN=""; WS_PATH=""; GRPC_SVC=""; SS_METHOD=""; PASSWORD=""
+  write_config_reality
+}
+
+_install_tls() {
+  local transport=$1  # "ws" or "grpc"
+  DOMAIN="${XRAY_DOMAIN:-}"
+  if [[ -z "$DOMAIN" ]]; then
+    read -r -p "  请输入域名（DNS A 记录已指向本机）: " DOMAIN
+    [[ -n "$DOMAIN" ]] || die "域名不能为空"
+  fi
+  get_cert "$DOMAIN"
+
+  local base="${PROTO%%-${transport}-tls}"
+  if [[ "$base" == "trojan" ]]; then
+    PASSWORD=$(gen_password); UUID=""
+  else
+    UUID=$(gen_uuid); PASSWORD=""
+  fi
+  WS_PATH=$(gen_path)
+  GRPC_SVC=$(gen_path)
+  PRIVKEY=""; PUBKEY=""; SHORTID=""; DEST=""; SNI=""; SS_METHOD=""
+
+  case "$transport" in
+    ws)   write_config_ws_tls ;;
+    grpc) write_config_grpc_tls ;;
+  esac
+}
+
+_install_ss() {
+  SS_METHOD="${XRAY_SS_METHOD:-}"
+  if [[ -z "$SS_METHOD" && -t 0 ]]; then
+    echo
+    printf '  加密方式：\n'
+    printf '  1. aes-256-gcm         %s(推荐，广泛兼容)%s\n' "$G" "$N"
+    printf '  2. chacha20-poly1305   (适合低性能设备)\n'
+    printf '  3. aes-128-gcm\n'
+    local m; read -r -p '  请选择 [1]: ' m
+    case "${m:-1}" in
+      2) SS_METHOD="chacha20-poly1305" ;;
+      3) SS_METHOD="aes-128-gcm" ;;
+      *) SS_METHOD="aes-256-gcm" ;;
+    esac
+  fi
+  [[ -z "$SS_METHOD" ]] && SS_METHOD="aes-256-gcm"
+  PASSWORD=$(gen_password)
+  UUID=""; PRIVKEY=""; PUBKEY=""; SHORTID=""; DEST=""; SNI=""
+  DOMAIN=""; WS_PATH=""; GRPC_SVC=""
+  write_config_ss
 }
 
 # ─────────────────────────── Commands ───────────────────────────
 cmd_install() {
   require_root
   if [[ -s "$XRAY_CONFIG" && -z "${FORCE:-}" ]]; then
-    warn "已存在 $XRAY_CONFIG —— 跳过初始化。如需重建请先 'uninstall' 或传 FORCE=1"
-    cmd_info
-    return
+    warn "已存在配置 —— 跳过。如需重建请传 FORCE=1"
+    cmd_info; return
   fi
   install_deps
   [[ -x "$XRAY_BIN" ]] || install_xray
 
-  local port uuid keys priv pub sid dest sni addr name link
-  port=$(pick_port)
-  uuid=$(gen_uuid)
-  keys=$(gen_keys); priv=${keys%|*}; pub=${keys#*|}
-  [[ -n "$priv" && -n "$pub" ]] || die "解析 xray x25519 输出失败"
-  sid=$(gen_shortid)
-  dest=$(pick_dest)
-  sni="$dest"
+  PROTO="${PROTOCOL:-}"
+  [[ -z "$PROTO" ]] && PROTO=$(select_protocol)
+  echo
 
-  if [[ -n "${REALITY_ADDR:-}" ]]; then
-    addr="$REALITY_ADDR"
-  else
-    addr=$(get_public_ip)
-    [[ -z "$addr" ]] && { warn "无法自动检测公网 IP，请用 REALITY_ADDR=… 指定"; addr="YOUR_SERVER"; }
+  # Port
+  case "$PROTO" in
+    *-ws-tls|*-grpc-tls) PORT="${REALITY_PORT:-443}" ;;
+    *)                    PORT=$(pick_port) ;;
+  esac
+
+  ADDR="${REALITY_ADDR:-}"
+  if [[ -z "$ADDR" ]]; then
+    ADDR=$(get_public_ip)
+    [[ -z "$ADDR" ]] && { warn "无法自动检测公网 IP"; ADDR="YOUR_SERVER"; }
   fi
-  name="${REALITY_NAME:-Reality-${addr}}"
+  NAME="${REALITY_NAME:-${PROTO}-${ADDR}}"
 
-  write_config "$port" "$uuid" "$priv" "$sid" "$dest" "$sni"
-  open_firewall "$port"
+  case "$PROTO" in
+    vless-reality)   _install_reality ;;
+    *-ws-tls)        _install_tls "ws" ;;
+    *-grpc-tls)      _install_tls "grpc" ;;
+    shadowsocks)     _install_ss ;;
+    *)               die "未知协议：$PROTO" ;;
+  esac
 
+  open_firewall "$PORT"
   systemctl enable --now xray >/dev/null
-  systemctl restart xray
-  sleep 1
+  systemctl restart xray; sleep 1
   if ! systemctl is-active --quiet xray; then
     journalctl -u xray -n 30 --no-pager >&2 || true
     die "Xray 启动失败，请检查上方日志"
   fi
   ok "Xray 服务运行中"
 
-  link=$(share_link "$addr" "$port" "$uuid" "$pub" "$sid" "$sni" "$name")
-  save_meta "$port" "$uuid" "$priv" "$pub" "$sid" "$dest" "$sni" "$addr" "$name"
+  local link; link=$(_build_link)
+  save_meta
   printf '%s\n' "$link" > "$XRAY_SHARE_FILE"; chmod 600 "$XRAY_SHARE_FILE"
   _self_install || true
   print_result "$link"
 }
 
 cmd_info() {
-  [[ -r "$XRAY_SHARE_FILE" ]] || die "未找到现有节点（$XRAY_SHARE_FILE）。先执行：$0 install"
-  print_result "$(cat "$XRAY_SHARE_FILE")"
+  [[ -r "$XRAY_META_FILE" ]] || die "未找到节点配置，请先执行安装。"
+  _reload_meta
+  print_result "$(_build_link)"
 }
 
-cmd_status() {
-  systemctl --no-pager --full status xray 2>&1 | sed -n '1,20p'
-}
-
-cmd_logs() { journalctl -u xray -n "${1:-50}" --no-pager; }
-
+cmd_status()  { systemctl --no-pager --full status xray 2>&1 | sed -n '1,20p'; }
+cmd_logs()    { journalctl -u xray -n "${1:-50}" --no-pager; }
 cmd_restart() {
   require_root
-  systemctl restart xray
-  sleep 1
-  systemctl is-active --quiet xray \
-    && ok "Xray 已重启" \
-    || warn "Xray 重启失败，请执行 'xr logs' 查看日志"
+  systemctl restart xray; sleep 1
+  systemctl is-active --quiet xray && ok "Xray 已重启" || warn "重启失败，执行 'xr logs' 查看"
 }
-
 cmd_update() {
-  require_root
-  install_xray
-  systemctl restart xray
-  ok "Xray 已升级并重启"
+  require_root; install_xray; systemctl restart xray; ok "Xray 已升级并重启"
 }
-
 cmd_uninstall() {
   require_root
   read -r -p "确认卸载 Xray 并清除配置？[y/N] " ans
@@ -405,87 +687,80 @@ cmd_uninstall() {
 # ─────────────────────────── Edit commands ───────────────────────────
 cmd_edit_port() {
   require_root; _reload_meta
-  local new_port
   printf "当前端口：${Y}%s${N}\n" "$PORT"
-  read -r -p "新端口（留空取消）: " new_port
-  [[ -z "$new_port" ]] && { msg "已取消"; return; }
-  [[ "$new_port" =~ ^[0-9]+$ ]] && (( new_port >= 1 && new_port <= 65535 )) \
-    || die "端口须为 1-65535 的整数"
-  PORT="$new_port"
-  open_firewall "$PORT"
-  _apply_changes
+  local new; read -r -p "新端口（留空取消）: " new
+  [[ -z "$new" ]] && { msg "已取消"; return; }
+  [[ "$new" =~ ^[0-9]+$ ]] && (( new >= 1 && new <= 65535 )) || die "端口须为 1-65535"
+  PORT="$new"; open_firewall "$PORT"; _apply_changes
   ok "端口已更新为 ${Y}$PORT${N}"
 }
 
 cmd_edit_uuid() {
   require_root; _reload_meta
-  local old_uuid="$UUID"
-  UUID=$(gen_uuid)
-  _apply_changes
-  ok "UUID 已重新生成"
-  printf "  旧：%s\n  新：%s\n" "$old_uuid" "$UUID"
+  case "$PROTO" in
+    trojan-*|shadowsocks)
+      local old="$PASSWORD"; PASSWORD=$(gen_password)
+      _apply_changes; ok "密码已重新生成"
+      printf "  旧：%s\n  新：%s\n" "$old" "$PASSWORD" ;;
+    *)
+      local old="$UUID"; UUID=$(gen_uuid)
+      _apply_changes; ok "UUID 已重新生成"
+      printf "  旧：%s\n  新：%s\n" "$old" "$UUID" ;;
+  esac
 }
 
 cmd_edit_dest() {
   require_root; _reload_meta
-  printf "当前伪装目标：${Y}%s${N}\n\n候选目标：\n" "$DEST"
-  local i=1
-  for d in "${DEFAULT_DESTS[@]}"; do
-    printf "  %d. %s\n" "$((i++))" "$d"
-  done
-  printf "  %d. 自定义输入\n\n" "$i"
+  if [[ "$PROTO" != "vless-reality" ]]; then
+    warn "此选项仅适用于 Reality 协议（当前：$PROTO）"; return; fi
+  printf "当前伪装目标：${Y}%s${N}\n\n候选：\n" "$DEST"
+  local i=1; for d in "${DEFAULT_DESTS[@]}"; do printf "  %d. %s\n" "$((i++))" "$d"; done
+  printf "  %d. 自定义\n\n" "$i"
   local choice new_dest=""
-  read -r -p "输入序号或直接输入域名（留空取消）: " choice
+  read -r -p "序号或直接输入域名（留空取消）: " choice
   [[ -z "$choice" ]] && { msg "已取消"; return; }
   if [[ "$choice" =~ ^[0-9]+$ ]]; then
     if (( choice >= 1 && choice <= ${#DEFAULT_DESTS[@]} )); then
       new_dest="${DEFAULT_DESTS[$((choice-1))]}"
     else
-      read -r -p "输入自定义域名: " new_dest
+      read -r -p "自定义域名: " new_dest
     fi
   else
     new_dest="$choice"
   fi
   [[ -z "$new_dest" ]] && { msg "已取消"; return; }
-  DEST="$new_dest"; SNI="$new_dest"
-  _apply_changes
+  DEST="$new_dest"; SNI="$new_dest"; _apply_changes
   ok "伪装目标已更新为 ${Y}$DEST${N}"
 }
 
 cmd_edit_name() {
   require_root; _reload_meta
-  printf "当前节点名称：${Y}%s${N}\n" "$NAME"
-  local new_name
-  read -r -p "新名称（留空取消）: " new_name
-  [[ -z "$new_name" ]] && { msg "已取消"; return; }
-  NAME="$new_name"
-  _apply_changes
-  ok "节点名称已更新为 ${Y}$NAME${N}"
+  printf "当前名称：${Y}%s${N}\n" "$NAME"
+  local new; read -r -p "新名称（留空取消）: " new
+  [[ -z "$new" ]] && { msg "已取消"; return; }
+  NAME="$new"; _apply_changes; ok "节点名称已更新为 ${Y}$NAME${N}"
 }
 
 # ─────────────────────────── Interactive menu ───────────────────────────
 cmd_menu() {
   require_root
-  local choice
   while true; do
     clear
-    # Header
     printf '%s╔══════════════════════════════════════════════════╗%s\n' "$B" "$N"
-    printf '%s║  Xray Reality 管理脚本 %-26s║%s\n' "$B" "v${SCRIPT_VERSION}" "$N"
+    printf '%s║  Xray 管理脚本 %-34s║%s\n' "$B" "v${SCRIPT_VERSION}" "$N"
     printf '%s╚══════════════════════════════════════════════════╝%s\n' "$B" "$N"
     echo
 
-    # Current node summary
     if [[ -r "$XRAY_META_FILE" ]]; then
       # shellcheck disable=SC1090
       . "$XRAY_META_FILE" 2>/dev/null || true
       local svc_str
       systemctl is-active --quiet xray 2>/dev/null \
-        && svc_str="${G}● 运行中${N}" \
-        || svc_str="${R}● 已停止${N}"
-      printf "  节点：${Y}%s${N}   端口：${Y}%s${N}   SNI：${Y}%s${N}\n" \
-        "${NAME:-—}" "${PORT:-—}" "${SNI:-—}"
-      printf "  服务状态：%b\n" "$svc_str"
+        && svc_str="${G}● 运行中${N}" || svc_str="${R}● 已停止${N}"
+      local id_display="${UUID:-${PASSWORD:-—}}"
+      printf "  协议：${Y}%-20s${N}  端口：${Y}%s${N}\n" "${PROTO:-—}" "${PORT:-—}"
+      local loc_display="${DOMAIN:-${ADDR:-—}}"
+      printf "  地址：${Y}%-20s${N}  状态：%b\n" "$loc_display" "$svc_str"
     else
       printf "  ${Y}未检测到节点配置，请先执行安装${N}\n"
     fi
@@ -494,8 +769,13 @@ cmd_menu() {
     printf '%s  ─────── 节点管理 ────────────────────────────%s\n' "$D" "$N"
     printf '  1. 查看节点信息 + 二维码\n'
     printf '  2. 修改端口\n'
-    printf '  3. 重新生成 UUID\n'
-    printf '  4. 修改伪装目标 (SNI)\n'
+    case "${PROTO:-}" in
+      trojan-*|shadowsocks) printf '  3. 重新生成密码\n' ;;
+      *)                    printf '  3. 重新生成 UUID\n' ;;
+    esac
+    [[ "${PROTO:-}" == "vless-reality" ]] \
+      && printf '  4. 修改伪装目标 (SNI)\n' \
+      || printf '  4. 修改伪装目标 %s(当前协议不支持)%s\n' "$D" "$N"
     printf '  5. 修改节点名称\n'
     echo
     printf '%s  ─────── 服务管理 ────────────────────────────%s\n' "$D" "$N"
@@ -507,11 +787,9 @@ cmd_menu() {
     printf '  9. 升级 Xray\n'
     printf '  10. 卸载 Xray\n'
     echo
-    printf '  0. 退出\n'
-    echo
-    read -r -p "  请输入选项: " choice
-    echo
+    printf '  0. 退出\n\n'
 
+    local choice; read -r -p "  请输入选项: " choice; echo
     case "$choice" in
       1)  cmd_info ;;
       2)  cmd_edit_port ;;
@@ -522,22 +800,16 @@ cmd_menu() {
       7)  cmd_logs 50 ;;
       8)  cmd_status ;;
       9)  cmd_update ;;
-      10) cmd_uninstall; [[ $? -eq 0 ]] && break || true ;;
+      10) cmd_uninstall; return ;;
       0)  break ;;
-      *)  warn "无效选项，请重新输入" ;;
+      *)  warn "无效选项" ;;
     esac
-
-    if [[ "$choice" != "0" ]]; then
-      echo
-      read -r -p "  按 Enter 返回主菜单..." _
-    fi
+    echo; read -r -p "  按 Enter 返回主菜单..." _
   done
 }
 
 # ─────────────────────────── Self install ───────────────────────────
 _self_install() {
-  # Works when script is run as `bash /tmp/xr.sh` (BASH_SOURCE[0] is a real file).
-  # Does not work when piped via stdin — use `curl ... -o /tmp/xr.sh && bash /tmp/xr.sh`.
   local src="${BASH_SOURCE[0]:-}"
   if [[ -z "$src" || ! -f "$src" ]]; then
     warn "无法自我复制（请用 'curl ... -o /tmp/xr.sh && bash /tmp/xr.sh' 方式执行）"
@@ -546,60 +818,50 @@ _self_install() {
   install -m 755 "$src" "$SELF_CMD"
   ok "管理命令已安装：${Y}$SELF_CMD${N}  →  输入 ${B}xr${N} 打开管理菜单"
 }
-
 cmd_self_install() { require_root; _self_install; }
 
 usage() {
   cat <<EOF
-${B}${SCRIPT_NAME} v${SCRIPT_VERSION}${N}  —  贴近官方的 Xray VLESS-Reality 一键脚本
+${B}${SCRIPT_NAME} v${SCRIPT_VERSION}${N}  —  多协议 Xray 一键脚本
 
-用法:
-  bash $0 [install]    安装节点（默认），成功后可用 xr 管理
-  bash $0 info         显示节点信息 + 分享链接 + 二维码
-  bash $0 status       Xray systemd 状态
-  bash $0 logs [N]     最近 N 条 Xray 日志（默认 50）
-  bash $0 restart      重启 Xray
-  bash $0 update       升级 Xray 到最新稳定版
-  bash $0 uninstall    卸载 Xray 并清除配置
-  bash $0 help         显示本帮助
+支持协议:
+  VLESS+Reality  VLESS/VMess/Trojan + WS/gRPC + TLS  Shadowsocks
 
-安装后管理命令 (xr):
-  xr               打开交互式管理菜单（含节点编辑）
-  xr info          显示节点信息 + 分享链接 + 二维码
-  xr status        Xray systemd 状态
-  xr logs [N]      最近 N 条日志
+用法 (首次安装):
+  bash $0 [install]   交互式选择协议并安装（默认）
+  bash $0 help        显示本帮助
+
+管理命令 (安装后输入 xr):
+  xr               打开交互式管理菜单
+  xr info          节点信息 + 分享链接 + 二维码
+  xr status        Xray 服务状态
+  xr logs [N]      最近 N 条日志（默认 50）
   xr restart       重启 Xray
   xr update        升级 Xray
   xr uninstall     卸载 Xray
   xr edit-port     修改端口
-  xr edit-uuid     重新生成 UUID
-  xr edit-dest     修改伪装目标 (SNI)
+  xr edit-uuid     重新生成 UUID / 密码
+  xr edit-dest     修改伪装目标（仅 Reality）
   xr edit-name     修改节点名称
 
 可选环境变量:
-  REALITY_PORT=443                    指定端口（默认随机 30000-50000，避开占用）
-  REALITY_DEST=www.apple.com          指定伪装目标（不指定则自动测速选最快）
-  REALITY_ADDR=1.2.3.4 或 my.domain   分享链接里的服务器地址（默认自动获取公网 IP）
-  REALITY_NAME=MyNode                 节点名称（默认 Reality-<addr>）
-  XRAY_VERSION=v26.3.27               固定 Xray 版本（默认装最新）
-  XRAY_INSTALLER_SHA256=<hex>         钉住官方 install-release.sh SHA256（强烈建议）
-  FORCE=1                             已有配置时也重建
-
-安全说明:
-  * 底层调用 XTLS 官方 install-release.sh（自带 SHA256 dgst 校验二进制）
-  * 全程 HTTPS + TLS1.2+，不写 ~/.bashrc，不安装 jq，不动 NTP
-  * Xray 以 nobody 运行（官方默认），配置 600 权限
-  * 分享链接中含 UUID/公钥，文件已设 600
-
-灵感来源: github.com/XTLS/Xray-install (官方) — 避开 233boy/Xray 的几个隐患。
+  PROTOCOL=vless-reality|shadowsocks|vless-ws-tls|vless-grpc-tls|
+           vmess-ws-tls|vmess-grpc-tls|trojan-ws-tls|trojan-grpc-tls
+  REALITY_PORT=443       端口（TLS 协议默认 443，Reality 默认随机）
+  REALITY_DEST=…         Reality 伪装目标
+  REALITY_ADDR=1.2.3.4   分享链接服务器地址
+  REALITY_NAME=MyNode    节点名称
+  XRAY_DOMAIN=my.domain  TLS 协议域名
+  XRAY_SS_METHOD=…       Shadowsocks 加密方式
+  XRAY_VERSION=v26.3.27  固定 Xray 版本
+  XRAY_INSTALLER_SHA256= 钉住官方安装脚本 SHA256
+  FORCE=1                已有配置时强制重建
 EOF
 }
 
 main() {
-  # When invoked as `xr`, default to interactive menu; otherwise default to install.
   local default_cmd="install"
   [[ "$(basename "${0:-}")" == "xr" ]] && default_cmd="menu"
-
   case "${1:-$default_cmd}" in
     menu)             cmd_menu ;;
     install)          cmd_install ;;
