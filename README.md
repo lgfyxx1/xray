@@ -1,6 +1,6 @@
 # xray-reality
 
-贴近官方的 Xray VLESS-Reality 一键部署脚本。底层调用 [XTLS/Xray-install](https://github.com/XTLS/Xray-install) 官方安装器（自带 SHA256 二进制校验），支持安装后 `xr` 命令管理节点。
+贴近官方的 Xray VLESS-Reality 一键部署脚本。底层调用 [XTLS/Xray-install](https://github.com/XTLS/Xray-install) 官方安装器（自带 SHA256 二进制校验），支持安装后 `xr` 命令交互式管理节点。
 
 ## 一键安装（推荐）
 
@@ -18,17 +18,52 @@ echo "$(curl -fsSL https://raw.githubusercontent.com/lgfyxx1/xray/main/xray-real
 sudo bash /tmp/xr.sh
 ```
 
-## 安装后管理
+## 安装后管理菜单
 
-安装成功后脚本自动把自身复制到 `/usr/local/bin/xr`，之后随时：
+安装成功后脚本自动把自身复制到 `/usr/local/bin/xr`，直接输入 `xr` 打开管理菜单：
+
+```
+╔══════════════════════════════════════════════════╗
+║  Xray Reality 管理脚本 v1.1.0                   ║
+╚══════════════════════════════════════════════════╝
+
+  节点：Reality-1.2.3.4   端口：43210   SNI：www.microsoft.com
+  服务状态：● 运行中
+
+  ─────── 节点管理 ────────────────────────────
+  1. 查看节点信息 + 二维码
+  2. 修改端口
+  3. 重新生成 UUID
+  4. 修改伪装目标 (SNI)
+  5. 修改节点名称
+
+  ─────── 服务管理 ────────────────────────────
+  6. 重启 Xray
+  7. 查看日志（最近 50 条）
+  8. 查看服务状态
+
+  ─────── 系统操作 ────────────────────────────
+  9. 升级 Xray
+  10. 卸载 Xray
+
+  0. 退出
+```
+
+## 命令速查
 
 ```bash
-xr              # 等同于 xr info，显示节点信息 + 分享链接 + 二维码
-xr info         # 显示节点信息
+xr              # 打开交互式管理菜单
+xr info         # 查看节点信息 + 分享链接 + 二维码
 xr status       # Xray 服务状态
 xr logs [N]     # 最近 N 条日志（默认 50）
+xr restart      # 重启 Xray
 xr update       # 升级 Xray 到最新稳定版
 xr uninstall    # 卸载 Xray 并清除配置
+# 直接编辑（无需进菜单）
+xr edit-port    # 修改端口
+xr edit-uuid    # 重新生成 UUID
+xr edit-dest    # 修改伪装目标 (SNI)
+xr edit-name    # 修改节点名称
 ```
 
 ## 可选环境变量

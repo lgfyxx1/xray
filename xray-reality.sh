@@ -11,7 +11,7 @@ IFS=$'\n\t'
 umask 077
 
 SCRIPT_NAME="xray-reality"
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.1.0"
 
 XRAY_BIN="/usr/local/bin/xray"
 SELF_CMD="/usr/local/bin/xr"
@@ -225,17 +225,19 @@ JSON
   chown nobody "$XRAY_CONFIG" 2>/dev/null || true
 }
 
+# save_meta PORT UUID PRIVKEY PUBKEY SHORTID DEST SNI ADDR NAME
 save_meta() {
   install -d -m 700 "$XRAY_CONFIG_DIR"
   cat > "$XRAY_META_FILE" <<EOF
 PORT=$1
 UUID=$2
-PUBKEY=$3
-SHORTID=$4
-DEST=$5
-SNI=$6
-ADDR=$7
-NAME=$8
+PRIVKEY=$3
+PUBKEY=$4
+SHORTID=$5
+DEST=$6
+SNI=$7
+ADDR=$8
+NAME=$9
 EOF
   chmod 600 "$XRAY_META_FILE"
 }
@@ -265,30 +267,56 @@ print_result() {
   local link=$1
   echo
   printf '%s\n' "${G}══════════════════════════════════════════════════════════════════${N}"
-  printf '%s\n' "${G} Xray VLESS-Reality 部署完成${N}"
+  printf '%s\n' "${G} Xray VLESS-Reality 节点信息${N}"
   printf '%s\n' "${G}══════════════════════════════════════════════════════════════════${N}"
   if [[ -r "$XRAY_META_FILE" ]]; then
     # shellcheck disable=SC1090
     . "$XRAY_META_FILE"
-    printf "  %-9s %s\n" "地址"   "$ADDR"
-    printf "  %-9s %s\n" "端口"   "$PORT"
-    printf "  %-9s %s\n" "UUID"   "$UUID"
-    printf "  %-9s %s\n" "公钥"   "$PUBKEY"
-    printf "  %-9s %s\n" "短 ID"  "$SHORTID"
-    printf "  %-9s %s\n" "SNI"    "$SNI"
+    printf "  %-9s %s\n" "地址"   "${ADDR:-}"
+    printf "  %-9s %s\n" "端口"   "${PORT:-}"
+    printf "  %-9s %s\n" "UUID"   "${UUID:-}"
+    printf "  %-9s %s\n" "公钥"   "${PUBKEY:-}"
+    printf "  %-9s %s\n" "短 ID"  "${SHORTID:-}"
+    printf "  %-9s %s\n" "SNI"    "${SNI:-}"
     printf "  %-9s %s\n" "Flow"   "xtls-rprx-vision"
     printf "  %-9s %s\n" "指纹"   "chrome"
     echo
   fi
-  printf '%s\n' "${B}分享链接：${N}"
+  printf '%s\n' "${B}── 分享链接 ─────────────────────────────────────────────────────${N}"
   printf '%s\n' "$link"
   echo
+  printf '%s\n' "${B}── 二维码 ───────────────────────────────────────────────────────${N}"
   if command -v qrencode >/dev/null; then
-    qrencode -t ANSIUTF8 -m 1 "$link"
+    qrencode -t ANSIUTF8 -m 2 "$link"
   else
-    printf '%s（安装 qrencode 可显示二维码）%s\n' "$D" "$N"
+    printf '%s  （安装 qrencode 后重新运行可显示二维码）%s\n' "$D" "$N"
   fi
-  printf '%s分享链接保存在：%s%s\n' "$D" "$XRAY_SHARE_FILE" "$N"
+  printf '%s分享链接已保存至：%s%s\n' "$D" "$XRAY_SHARE_FILE" "$N"
+}
+
+# ─────────────────────────── Meta helpers ───────────────────────────
+_reload_meta() {
+  [[ -r "$XRAY_META_FILE" ]] || die "未找到节点配置（$XRAY_META_FILE），请先执行安装。"
+  # shellcheck disable=SC1090
+  . "$XRAY_META_FILE"
+  # Backward compat: old meta files lack PRIVKEY; extract from config.json.
+  if [[ -z "${PRIVKEY:-}" ]]; then
+    PRIVKEY=$(grep '"privateKey"' "$XRAY_CONFIG" 2>/dev/null \
+              | sed 's/.*"privateKey"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+    [[ -n "$PRIVKEY" ]] || die "无法读取私钥，配置文件可能损坏"
+  fi
+}
+
+_apply_changes() {
+  write_config "$PORT" "$UUID" "$PRIVKEY" "$SHORTID" "$DEST" "$SNI"
+  save_meta "$PORT" "$UUID" "$PRIVKEY" "$PUBKEY" "$SHORTID" "$DEST" "$SNI" "$ADDR" "$NAME"
+  local link; link=$(share_link "$ADDR" "$PORT" "$UUID" "$PUBKEY" "$SHORTID" "$SNI" "$NAME")
+  printf '%s\n' "$link" > "$XRAY_SHARE_FILE"; chmod 600 "$XRAY_SHARE_FILE"
+  systemctl restart xray
+  sleep 1
+  systemctl is-active --quiet xray \
+    && ok "Xray 已重启" \
+    || warn "Xray 重启后未运行，请执行 'xr logs' 查看日志"
 }
 
 # ─────────────────────────── Commands ───────────────────────────
@@ -332,7 +360,7 @@ cmd_install() {
   ok "Xray 服务运行中"
 
   link=$(share_link "$addr" "$port" "$uuid" "$pub" "$sid" "$sni" "$name")
-  save_meta "$port" "$uuid" "$pub" "$sid" "$dest" "$sni" "$addr" "$name"
+  save_meta "$port" "$uuid" "$priv" "$pub" "$sid" "$dest" "$sni" "$addr" "$name"
   printf '%s\n' "$link" > "$XRAY_SHARE_FILE"; chmod 600 "$XRAY_SHARE_FILE"
   _self_install || true
   print_result "$link"
@@ -348,6 +376,15 @@ cmd_status() {
 }
 
 cmd_logs() { journalctl -u xray -n "${1:-50}" --no-pager; }
+
+cmd_restart() {
+  require_root
+  systemctl restart xray
+  sleep 1
+  systemctl is-active --quiet xray \
+    && ok "Xray 已重启" \
+    || warn "Xray 重启失败，请执行 'xr logs' 查看日志"
+}
 
 cmd_update() {
   require_root
@@ -365,6 +402,139 @@ cmd_uninstall() {
   ok "卸载完成"
 }
 
+# ─────────────────────────── Edit commands ───────────────────────────
+cmd_edit_port() {
+  require_root; _reload_meta
+  local new_port
+  printf "当前端口：${Y}%s${N}\n" "$PORT"
+  read -r -p "新端口（留空取消）: " new_port
+  [[ -z "$new_port" ]] && { msg "已取消"; return; }
+  [[ "$new_port" =~ ^[0-9]+$ ]] && (( new_port >= 1 && new_port <= 65535 )) \
+    || die "端口须为 1-65535 的整数"
+  PORT="$new_port"
+  open_firewall "$PORT"
+  _apply_changes
+  ok "端口已更新为 ${Y}$PORT${N}"
+}
+
+cmd_edit_uuid() {
+  require_root; _reload_meta
+  local old_uuid="$UUID"
+  UUID=$(gen_uuid)
+  _apply_changes
+  ok "UUID 已重新生成"
+  printf "  旧：%s\n  新：%s\n" "$old_uuid" "$UUID"
+}
+
+cmd_edit_dest() {
+  require_root; _reload_meta
+  printf "当前伪装目标：${Y}%s${N}\n\n候选目标：\n" "$DEST"
+  local i=1
+  for d in "${DEFAULT_DESTS[@]}"; do
+    printf "  %d. %s\n" "$((i++))" "$d"
+  done
+  printf "  %d. 自定义输入\n\n" "$i"
+  local choice new_dest=""
+  read -r -p "输入序号或直接输入域名（留空取消）: " choice
+  [[ -z "$choice" ]] && { msg "已取消"; return; }
+  if [[ "$choice" =~ ^[0-9]+$ ]]; then
+    if (( choice >= 1 && choice <= ${#DEFAULT_DESTS[@]} )); then
+      new_dest="${DEFAULT_DESTS[$((choice-1))]}"
+    else
+      read -r -p "输入自定义域名: " new_dest
+    fi
+  else
+    new_dest="$choice"
+  fi
+  [[ -z "$new_dest" ]] && { msg "已取消"; return; }
+  DEST="$new_dest"; SNI="$new_dest"
+  _apply_changes
+  ok "伪装目标已更新为 ${Y}$DEST${N}"
+}
+
+cmd_edit_name() {
+  require_root; _reload_meta
+  printf "当前节点名称：${Y}%s${N}\n" "$NAME"
+  local new_name
+  read -r -p "新名称（留空取消）: " new_name
+  [[ -z "$new_name" ]] && { msg "已取消"; return; }
+  NAME="$new_name"
+  _apply_changes
+  ok "节点名称已更新为 ${Y}$NAME${N}"
+}
+
+# ─────────────────────────── Interactive menu ───────────────────────────
+cmd_menu() {
+  require_root
+  local choice
+  while true; do
+    clear
+    # Header
+    printf '%s╔══════════════════════════════════════════════════╗%s\n' "$B" "$N"
+    printf '%s║  Xray Reality 管理脚本 %-26s║%s\n' "$B" "v${SCRIPT_VERSION}" "$N"
+    printf '%s╚══════════════════════════════════════════════════╝%s\n' "$B" "$N"
+    echo
+
+    # Current node summary
+    if [[ -r "$XRAY_META_FILE" ]]; then
+      # shellcheck disable=SC1090
+      . "$XRAY_META_FILE" 2>/dev/null || true
+      local svc_str
+      systemctl is-active --quiet xray 2>/dev/null \
+        && svc_str="${G}● 运行中${N}" \
+        || svc_str="${R}● 已停止${N}"
+      printf "  节点：${Y}%s${N}   端口：${Y}%s${N}   SNI：${Y}%s${N}\n" \
+        "${NAME:-—}" "${PORT:-—}" "${SNI:-—}"
+      printf "  服务状态：%b\n" "$svc_str"
+    else
+      printf "  ${Y}未检测到节点配置，请先执行安装${N}\n"
+    fi
+
+    echo
+    printf '%s  ─────── 节点管理 ────────────────────────────%s\n' "$D" "$N"
+    printf '  1. 查看节点信息 + 二维码\n'
+    printf '  2. 修改端口\n'
+    printf '  3. 重新生成 UUID\n'
+    printf '  4. 修改伪装目标 (SNI)\n'
+    printf '  5. 修改节点名称\n'
+    echo
+    printf '%s  ─────── 服务管理 ────────────────────────────%s\n' "$D" "$N"
+    printf '  6. 重启 Xray\n'
+    printf '  7. 查看日志（最近 50 条）\n'
+    printf '  8. 查看服务状态\n'
+    echo
+    printf '%s  ─────── 系统操作 ────────────────────────────%s\n' "$D" "$N"
+    printf '  9. 升级 Xray\n'
+    printf '  10. 卸载 Xray\n'
+    echo
+    printf '  0. 退出\n'
+    echo
+    read -r -p "  请输入选项: " choice
+    echo
+
+    case "$choice" in
+      1)  cmd_info ;;
+      2)  cmd_edit_port ;;
+      3)  cmd_edit_uuid ;;
+      4)  cmd_edit_dest ;;
+      5)  cmd_edit_name ;;
+      6)  cmd_restart ;;
+      7)  cmd_logs 50 ;;
+      8)  cmd_status ;;
+      9)  cmd_update ;;
+      10) cmd_uninstall; [[ $? -eq 0 ]] && break || true ;;
+      0)  break ;;
+      *)  warn "无效选项，请重新输入" ;;
+    esac
+
+    if [[ "$choice" != "0" ]]; then
+      echo
+      read -r -p "  按 Enter 返回主菜单..." _
+    fi
+  done
+}
+
+# ─────────────────────────── Self install ───────────────────────────
 _self_install() {
   # Works when script is run as `bash /tmp/xr.sh` (BASH_SOURCE[0] is a real file).
   # Does not work when piped via stdin — use `curl ... -o /tmp/xr.sh && bash /tmp/xr.sh`.
@@ -374,7 +544,7 @@ _self_install() {
     return
   fi
   install -m 755 "$src" "$SELF_CMD"
-  ok "管理命令已安装：$SELF_CMD  （以后直接运行 'xr info' / 'xr status' / 'xr update' …）"
+  ok "管理命令已安装：${Y}$SELF_CMD${N}  →  输入 ${B}xr${N} 打开管理菜单"
 }
 
 cmd_self_install() { require_root; _self_install; }
@@ -384,20 +554,27 @@ usage() {
 ${B}${SCRIPT_NAME} v${SCRIPT_VERSION}${N}  —  贴近官方的 Xray VLESS-Reality 一键脚本
 
 用法:
-  bash $0 [install]    安装并自动生成 VLESS-Reality 节点（默认），安装后可用 xr 管理
+  bash $0 [install]    安装节点（默认），成功后可用 xr 管理
   bash $0 info         显示节点信息 + 分享链接 + 二维码
   bash $0 status       Xray systemd 状态
   bash $0 logs [N]     最近 N 条 Xray 日志（默认 50）
+  bash $0 restart      重启 Xray
   bash $0 update       升级 Xray 到最新稳定版
   bash $0 uninstall    卸载 Xray 并清除配置
   bash $0 help         显示本帮助
 
 安装后管理命令 (xr):
-  xr / xr info         显示节点信息 + 分享链接 + 二维码
-  xr status            Xray systemd 状态
-  xr logs [N]          最近 N 条日志
-  xr update            升级 Xray
-  xr uninstall         卸载 Xray
+  xr               打开交互式管理菜单（含节点编辑）
+  xr info          显示节点信息 + 分享链接 + 二维码
+  xr status        Xray systemd 状态
+  xr logs [N]      最近 N 条日志
+  xr restart       重启 Xray
+  xr update        升级 Xray
+  xr uninstall     卸载 Xray
+  xr edit-port     修改端口
+  xr edit-uuid     重新生成 UUID
+  xr edit-dest     修改伪装目标 (SNI)
+  xr edit-name     修改节点名称
 
 可选环境变量:
   REALITY_PORT=443                    指定端口（默认随机 30000-50000，避开占用）
@@ -419,15 +596,25 @@ EOF
 }
 
 main() {
-  case "${1:-install}" in
-    install)        cmd_install ;;
-    info|link|show) cmd_info ;;
-    status)         cmd_status ;;
-    logs)           shift || true; cmd_logs "${1:-50}" ;;
-    update|upgrade) cmd_update ;;
+  # When invoked as `xr`, default to interactive menu; otherwise default to install.
+  local default_cmd="install"
+  [[ "$(basename "${0:-}")" == "xr" ]] && default_cmd="menu"
+
+  case "${1:-$default_cmd}" in
+    menu)             cmd_menu ;;
+    install)          cmd_install ;;
+    info|link|show)   cmd_info ;;
+    status)           cmd_status ;;
+    logs)             shift || true; cmd_logs "${1:-50}" ;;
+    restart)          cmd_restart ;;
+    update|upgrade)   cmd_update ;;
     uninstall|remove) cmd_uninstall ;;
-    self-install)   cmd_self_install ;;
-    help|-h|--help) usage ;;
+    edit-port)        cmd_edit_port ;;
+    edit-uuid)        cmd_edit_uuid ;;
+    edit-dest)        cmd_edit_dest ;;
+    edit-name)        cmd_edit_name ;;
+    self-install)     cmd_self_install ;;
+    help|-h|--help)   usage ;;
     *) usage; exit 1 ;;
   esac
 }
