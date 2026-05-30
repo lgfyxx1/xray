@@ -5,14 +5,14 @@
 ## 一键安装
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/shsu6688/xray/main/xray-reality.sh)
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/lgfyxx1/xray/main/xray-reality.sh)
 ```
 
 ### 加固版（推荐，先校验脚本再执行）
 
 ```bash
-EXPECT=$(curl -fsSL https://raw.githubusercontent.com/shsu6688/xray/main/xray-reality.sh | sha256sum | awk '{print $1}')
-curl -fsSL https://raw.githubusercontent.com/shsu6688/xray/main/xray-reality.sh -o /tmp/xr.sh
+EXPECT=$(curl -fsSL https://raw.githubusercontent.com/lgfyxx1/xray/main/xray-reality.sh | sha256sum | awk '{print $1}')
+curl -fsSL https://raw.githubusercontent.com/lgfyxx1/xray/main/xray-reality.sh -o /tmp/xr.sh
 echo "$EXPECT  /tmp/xr.sh" | sha256sum -c -
 sudo bash /tmp/xr.sh
 ```
@@ -20,8 +20,8 @@ sudo bash /tmp/xr.sh
 ### 远程一键安装并自动注册 `xr` 管理命令
 
 ```bash
-sudo XR_SELF_URL=https://raw.githubusercontent.com/shsu6688/xray/main/xray-reality.sh \
-  bash <(curl -fsSL https://raw.githubusercontent.com/shsu6688/xray/main/xray-reality.sh)
+sudo XR_SELF_URL=https://raw.githubusercontent.com/lgfyxx1/xray/main/xray-reality.sh \
+  bash <(curl -fsSL https://raw.githubusercontent.com/lgfyxx1/xray/main/xray-reality.sh)
 ```
 
 ## 安装后管理
