@@ -227,7 +227,7 @@ JSON
 
 # save_meta PORT UUID PRIVKEY PUBKEY SHORTID DEST SNI ADDR NAME
 save_meta() {
-  install -d -m 700 "$XRAY_CONFIG_DIR"
+  install -d -m 755 "$XRAY_CONFIG_DIR"
   cat > "$XRAY_META_FILE" <<EOF
 PORT=$1
 UUID=$2
