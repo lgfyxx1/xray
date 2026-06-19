@@ -17,6 +17,7 @@ XRAY_SHARE_FILE="${XRAY_CONFIG_DIR}/.share.txt"
 XRAY_META_FILE="${XRAY_CONFIG_DIR}/.meta.env"
 SSL_DIR="${XRAY_CONFIG_DIR}/ssl"
 ACME_SH="$HOME/.acme.sh/acme.sh"
+ACME_ACCOUNT_CONF="$HOME/.acme.sh/account.conf"
 
 OFFICIAL_INSTALLER_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
 
@@ -219,8 +220,13 @@ ensure_acme_account() {
     warn "检测到旧的 ACME 联系邮箱缓存，正在重置：$ca_dir"
     rm -rf "$ca_dir"
   fi
+  mkdir -p "$(dirname "$ACME_ACCOUNT_CONF")"
+  if [[ -f "$ACME_ACCOUNT_CONF" ]]; then
+    sed -i.bak "/^ACCOUNT_EMAIL=/d" "$ACME_ACCOUNT_CONF" 2>/dev/null || true
+  fi
+  printf "ACCOUNT_EMAIL='%s'\n" "$acme_email" >>"$ACME_ACCOUNT_CONF"
   msg "同步 ACME 账户邮箱：$acme_email"
-  "$ACME_SH" --server "$server" --register-account -m "$acme_email" 2>&1 \
+  "$ACME_SH" --server "$server" --register-account 2>&1 \
     || "$ACME_SH" --server "$server" --update-account -m "$acme_email" 2>&1 \
     || die "ACME 账户初始化失败，请检查 ACME_EMAIL 是否为真实可用邮箱"
 }
