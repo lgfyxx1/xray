@@ -238,22 +238,41 @@ get_cert() {
   local domain=$1
   install_acme
   mkdir -p "$SSL_DIR"
-  local users
-  users=$(port_users 80)
-  if [[ -n "$users" && -z "${ACME_STOP_SERVICES:-}" ]]; then
-    printf '%s\n%s\n' "80 端口已被占用：" "$users" >&2
-    die "证书申请需要临时占用 80 端口。可先停 nginx，或用 ACME_STOP_SERVICES=nginx 让脚本临时停启。"
-  fi
-  stop_acme_services
-  msg "申请 TLS 证书：$domain（Let's Encrypt standalone 模式，需要 80 端口空闲）"
-  if ! "$ACME_SH" --issue -d "$domain" --standalone --httpport 80 \
-      --server letsencrypt --force 2>&1 \
-    && ! "$ACME_SH" --issue -d "$domain" --standalone --httpport 80 \
-       --server zerossl --force 2>&1; then
+  if [[ "${ACME_DNS:-}" == "cloudflare" ]]; then
+    [[ -n "${CF_Token:-}" ]] || die "Cloudflare DNS 验证需要设置 CF_Token"
+    [[ -n "${CF_Zone_ID:-}" ]] || warn "未设置 CF_Zone_ID，acme.sh 将自动解析 Zone"
+    [[ -n "${CF_Account_ID:-}" ]] || warn "未设置 CF_Account_ID，通常可继续，但建议显式提供"
+    msg "申请 TLS 证书：$domain（Cloudflare DNS 验证，不占用 80 端口）"
+    if ! CF_Token="${CF_Token}" \
+         CF_Zone_ID="${CF_Zone_ID:-}" \
+         CF_Account_ID="${CF_Account_ID:-}" \
+         "$ACME_SH" --issue --dns dns_cf -d "$domain" \
+           --server letsencrypt --force 2>&1 \
+      && ! CF_Token="${CF_Token}" \
+         CF_Zone_ID="${CF_Zone_ID:-}" \
+         CF_Account_ID="${CF_Account_ID:-}" \
+         "$ACME_SH" --issue --dns dns_cf -d "$domain" \
+           --server zerossl --force 2>&1; then
+      die "Cloudflare DNS 验证申请证书失败。请确认：1) CF_Token 权限正确 2) 域名在该 Zone 下"
+    fi
+  else
+    local users
+    users=$(port_users 80)
+    if [[ -n "$users" && -z "${ACME_STOP_SERVICES:-}" ]]; then
+      printf '%s\n%s\n' "80 端口已被占用：" "$users" >&2
+      die "证书申请需要临时占用 80 端口。可先停 nginx，或用 ACME_STOP_SERVICES=nginx 让脚本临时停启。"
+    fi
+    stop_acme_services
+    msg "申请 TLS 证书：$domain（Let's Encrypt standalone 模式，需要 80 端口空闲）"
+    if ! "$ACME_SH" --issue -d "$domain" --standalone --httpport 80 \
+        --server letsencrypt --force 2>&1 \
+      && ! "$ACME_SH" --issue -d "$domain" --standalone --httpport 80 \
+         --server zerossl --force 2>&1; then
+      restart_acme_services
+      die "证书申请失败。请确认：1) 域名 DNS A 记录指向本机 2) 80 端口未被占用"
+    fi
     restart_acme_services
-    die "证书申请失败。请确认：1) 域名 DNS A 记录指向本机 2) 80 端口未被占用"
   fi
-  restart_acme_services
 
   "$ACME_SH" --install-cert -d "$domain" \
     --key-file        "$SSL_DIR/privkey.pem" \

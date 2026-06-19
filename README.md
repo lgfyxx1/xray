@@ -22,11 +22,19 @@ TLS 协议会自动通过 **acme.sh + Let's Encrypt** 申请证书，需要：
 - 80 端口空闲（申请证书时临时占用）
 - 如果 80 端口被 nginx 占用，可先停 nginx，或使用 `ACME_STOP_SERVICES=nginx` 让脚本申请证书时临时停启
 - TLS/CDN 协议默认监听 443；如果 nginx 也占用 443，需要先调整或停止 nginx，或改用 Cloudflare 支持的其他 HTTPS 端口
+- 如果域名托管在 Cloudflare，推荐使用 `ACME_DNS=cloudflare` 改走 DNS 验证，不占用 80 端口
 
 ## 一键安装
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/lgfyxx1/xray/main/xray-reality.sh -o /tmp/xr.sh && sudo bash /tmp/xr.sh
+```
+
+Cloudflare DNS 验证示例：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/lgfyxx1/xray/main/xray-reality.sh -o /tmp/xr.sh
+CF_Token=your_cloudflare_api_token ACME_DNS=cloudflare REALITY_PORT=8443 FORCE=1 bash /tmp/xr.sh
 ```
 
 安装时会弹出协议选择菜单。
@@ -92,7 +100,11 @@ xr edit-name    # 修改节点名称
 | `XRAY_DOMAIN=my.domain` | TLS 协议域名 |
 | `XRAY_SS_METHOD=aes-256-gcm` | Shadowsocks 加密方式 |
 | `XRAY_VERSION=v26.3.27` | 固定 Xray 版本 |
+| `ACME_DNS=cloudflare` | 使用 Cloudflare DNS API 做证书验证，不占用 80 端口 |
 | `ACME_STOP_SERVICES=nginx` | 申请证书前临时停止服务，申请后恢复 |
+| `CF_Token=...` | Cloudflare API Token，供 `dns_cf` 验证使用 |
+| `CF_Zone_ID=...` | 可选，Cloudflare Zone ID |
+| `CF_Account_ID=...` | 可选，Cloudflare Account ID |
 | `FORCE=1` | 已有配置时强制重建 |
 
 ## License
