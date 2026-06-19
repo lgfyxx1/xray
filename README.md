@@ -2,6 +2,8 @@
 
 多协议 Xray 一键部署脚本，底层调用 [XTLS/Xray-install](https://github.com/XTLS/Xray-install) 官方安装器。
 
+脚本安装时会尝试启用 Linux `BBR` 拥塞控制；如果当前内核不支持，会自动跳过。
+
 ## 支持协议
 
 | # | 协议 | 是否需要域名 | 特点 |

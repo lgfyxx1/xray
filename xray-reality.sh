@@ -18,6 +18,7 @@ XRAY_META_FILE="${XRAY_CONFIG_DIR}/.meta.env"
 SSL_DIR="${XRAY_CONFIG_DIR}/ssl"
 ACME_SH="$HOME/.acme.sh/acme.sh"
 ACME_ACCOUNT_CONF="$HOME/.acme.sh/account.conf"
+BBR_SYSCTL_CONF="/etc/sysctl.d/99-xray-bbr.conf"
 
 OFFICIAL_INSTALLER_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
 
@@ -104,6 +105,31 @@ install_deps() {
       warn "当前软件源未提供 qrencode，跳过二维码工具安装"
     fi
   fi
+}
+
+enable_bbr() {
+  local available_cc current_cc current_qdisc
+  available_cc=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+  if [[ " $available_cc " != *" bbr "* ]]; then
+    warn "当前内核未提供 BBR，跳过启用"
+    return 0
+  fi
+  current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
+  current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || true)
+  if [[ "$current_cc" == "bbr" && "$current_qdisc" == "fq" ]]; then
+    ok "BBR 已启用"
+    return 0
+  fi
+  cat >"$BBR_SYSCTL_CONF" <<'EOF'
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+  sysctl --system >/dev/null 2>&1 || die "应用 BBR sysctl 配置失败"
+  current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
+  current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || true)
+  [[ "$current_cc" == "bbr" && "$current_qdisc" == "fq" ]] \
+    && ok "已启用 BBR 加速" \
+    || warn "已写入 BBR 配置，但当前未确认生效"
 }
 
 # ─────────────────────────── Xray core ───────────────────────────
@@ -791,6 +817,7 @@ cmd_install() {
     warn "发现 Xray 配置但缺少节点信息，将继续重建。"
   fi
   install_deps
+  enable_bbr
   [[ -x "$XRAY_BIN" ]] || install_xray
 
   PROTO="${PROTOCOL:-}"
@@ -1032,6 +1059,9 @@ ${B}${SCRIPT_NAME} v${SCRIPT_VERSION}${N}  —  多协议 Xray 一键脚本
   XRAY_VERSION=v26.3.27  固定 Xray 版本
   XRAY_INSTALLER_SHA256= 钉住官方安装脚本 SHA256
   FORCE=1                已有配置时强制重建
+
+系统优化:
+  默认尝试启用 BBR；若内核不支持则自动跳过
 EOF
 }
 
