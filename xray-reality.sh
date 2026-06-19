@@ -186,11 +186,40 @@ gen_uuid()    { "$XRAY_BIN" uuid; }
 gen_password() { openssl rand -hex 16; }
 gen_path()    { openssl rand -hex 8; }
 
+trim_spaces() {
+  local s=${1-}
+  s="${s#${s%%[![:space:]]*}}"
+  s="${s%${s##*[![:space:]]}}"
+  printf '%s' "$s"
+}
+
+normalize_domain() {
+  local domain
+  domain=$(trim_spaces "${1-}")
+  domain=${domain%.}
+  printf '%s' "$domain"
+}
+
+read_domain_or_die() {
+  local domain="${XRAY_DOMAIN:-}"
+  if [[ -z "$domain" ]]; then
+    read -r -p "  请输入域名（DNS A 记录已指向本机）: " domain
+  fi
+  domain=$(normalize_domain "$domain")
+  [[ -n "$domain" ]] || die "域名不能为空"
+  printf '%s\n' "  即将申请并配置的域名: $domain" >&2
+  if [[ -z "${XRAY_DOMAIN:-}" && -t 0 ]]; then
+    local confirm
+    read -r -p "  确认无误？[Y/n]: " confirm
+    [[ "${confirm:-Y}" =~ ^[Yy]$ ]] || die "已取消，请重新执行并输入正确域名"
+  fi
+  printf '%s' "$domain"
+}
+
 get_acme_email() {
   local acme_email="${ACME_EMAIL:-}"
+  acme_email=$(trim_spaces "$acme_email")
   [[ -n "$acme_email" ]] || die "TLS 证书申请需要设置 ACME_EMAIL"
-  acme_email="${acme_email#${acme_email%%[![:space:]]*}}"
-  acme_email="${acme_email%${acme_email##*[![:space:]]}}"
   [[ "$acme_email" == *"@"* && "$acme_email" == *.* ]] \
     || die "ACME_EMAIL 格式无效，请提供真实可用邮箱：${acme_email:-<empty>}"
   printf '%s' "$acme_email"
@@ -706,11 +735,7 @@ _install_reality() {
 
 _install_tls() {
   local transport=$1  # "ws" or "grpc"
-  DOMAIN="${XRAY_DOMAIN:-}"
-  if [[ -z "$DOMAIN" ]]; then
-    read -r -p "  请输入域名（DNS A 记录已指向本机）: " DOMAIN
-    [[ -n "$DOMAIN" ]] || die "域名不能为空"
-  fi
+  DOMAIN=$(read_domain_or_die)
   get_cert "$DOMAIN"
 
   local base="${PROTO%%-${transport}-tls}"
@@ -731,11 +756,7 @@ _install_tls() {
 
 _install_ss() {
   # Domain + cert (SS traffic must be hidden in HTTPS to avoid probing)
-  DOMAIN="${XRAY_DOMAIN:-}"
-  if [[ -z "$DOMAIN" ]]; then
-    read -r -p "  请输入域名（DNS A 记录已指向本机）: " DOMAIN
-    [[ -n "$DOMAIN" ]] || die "域名不能为空"
-  fi
+  DOMAIN=$(read_domain_or_die)
   get_cert "$DOMAIN"
 
   SS_METHOD="${XRAY_SS_METHOD:-}"
