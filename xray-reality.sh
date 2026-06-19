@@ -878,6 +878,17 @@ cmd_restart() {
 cmd_update() {
   require_root; install_xray; systemctl restart xray; ok "Xray 已升级并重启"
 }
+cmd_delete_node() {
+  require_root
+  [[ -r "$XRAY_META_FILE" || -s "$XRAY_CONFIG" ]] || { warn "未检测到节点配置"; return; }
+  read -r -p "确认删除当前节点配置并停止 Xray？[y/N] " ans
+  [[ "${ans:-N}" =~ ^[Yy]$ ]] || { msg "已取消"; return; }
+  systemctl stop xray >/dev/null 2>&1 || true
+  rm -f "$XRAY_CONFIG" "$XRAY_META_FILE" "$XRAY_SHARE_FILE"
+  rm -f "$SSL_DIR/privkey.pem" "$SSL_DIR/fullchain.pem"
+  rmdir "$SSL_DIR" 2>/dev/null || true
+  ok "当前节点已删除，Xray 程序仍保留"
+}
 cmd_uninstall() {
   require_root
   read -r -p "确认卸载 Xray 并清除配置？[y/N] " ans
@@ -988,7 +999,8 @@ cmd_menu() {
     echo
     printf '%s  ─────── 系统操作 ────────────────────────────%s\n' "$D" "$N"
     printf '  9. 升级 Xray\n'
-    printf '  10. 卸载 Xray\n'
+    printf '  10. 删除当前节点\n'
+    printf '  11. 卸载 Xray\n'
     echo
     printf '  0. 退出\n\n'
 
@@ -1003,7 +1015,8 @@ cmd_menu() {
       7)  cmd_logs 50 ;;
       8)  cmd_status ;;
       9)  cmd_update ;;
-      10) cmd_uninstall; return ;;
+      10) cmd_delete_node ;;
+      11) cmd_uninstall; return ;;
       0)  break ;;
       *)  warn "无效选项" ;;
     esac
@@ -1041,6 +1054,7 @@ ${B}${SCRIPT_NAME} v${SCRIPT_VERSION}${N}  —  多协议 Xray 一键脚本
   xr logs [N]      最近 N 条日志（默认 50）
   xr restart       重启 Xray
   xr update        升级 Xray
+  xr delete-node   删除当前节点配置
   xr uninstall     卸载 Xray
   xr edit-port     修改端口
   xr edit-uuid     重新生成 UUID / 密码
@@ -1076,6 +1090,7 @@ main() {
     logs)             shift || true; cmd_logs "${1:-50}" ;;
     restart)          cmd_restart ;;
     update|upgrade)   cmd_update ;;
+    delete-node)      cmd_delete_node ;;
     uninstall|remove) cmd_uninstall ;;
     edit-port)        cmd_edit_port ;;
     edit-uuid)        cmd_edit_uuid ;;

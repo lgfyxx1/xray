@@ -83,6 +83,7 @@ xr status       # 服务状态
 xr logs [N]     # 最近 N 条日志
 xr restart      # 重启
 xr update       # 升级 Xray
+xr delete-node  # 删除当前节点配置，保留 Xray 程序
 xr uninstall    # 卸载
 xr edit-port    # 修改端口
 xr edit-uuid    # 重新生成 UUID / 密码
