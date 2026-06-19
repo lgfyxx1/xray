@@ -58,29 +58,50 @@ detect_pm() {
 }
 
 pkg_install() {
-  local pkgs="$*"
+  local pkgs=("$@")
+  ((${#pkgs[@]})) || return 0
   case "$PM" in
     apt)    DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null
-            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends $pkgs >/dev/null ;;
-    dnf)    dnf install -y -q $pkgs >/dev/null ;;
-    yum)    yum install -y -q $pkgs >/dev/null ;;
-    zypper) zypper --non-interactive install -y $pkgs >/dev/null ;;
-    pacman) pacman -Sy --noconfirm --needed $pkgs >/dev/null ;;
-    apk)    apk add --no-cache $pkgs >/dev/null ;;
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "${pkgs[@]}" >/dev/null ;;
+    dnf)    dnf install -y -q "${pkgs[@]}" >/dev/null ;;
+    yum)    yum install -y -q "${pkgs[@]}" >/dev/null ;;
+    zypper) zypper --non-interactive install -y "${pkgs[@]}" >/dev/null ;;
+    pacman) pacman -Sy --noconfirm --needed "${pkgs[@]}" >/dev/null ;;
+    apk)    apk add --no-cache "${pkgs[@]}" >/dev/null ;;
+  esac
+}
+
+pkg_available() {
+  local pkg=$1
+  case "$PM" in
+    apt)    DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null
+            apt-cache show "$pkg" >/dev/null 2>&1 ;;
+    dnf)    dnf -q repoquery "$pkg" >/dev/null 2>&1 ;;
+    yum)    yum -q list available "$pkg" >/dev/null 2>&1 ;;
+    zypper) zypper --non-interactive search -x "$pkg" >/dev/null 2>&1 ;;
+    pacman) pacman -Sy >/dev/null 2>&1 && pacman -Si "$pkg" >/dev/null 2>&1 ;;
+    apk)    apk search -e "$pkg" >/dev/null 2>&1 ;;
   esac
 }
 
 install_deps() {
   detect_pm
-  local pkgs=""
-  command -v curl     >/dev/null || pkgs+=" curl"
-  command -v openssl  >/dev/null || pkgs+=" openssl"
-  command -v ss       >/dev/null || case "$PM" in apt|zypper|pacman|apk) pkgs+=" iproute2";; *) pkgs+=" iproute";; esac
-  command -v qrencode >/dev/null || pkgs+=" qrencode"
-  command -v tar      >/dev/null || pkgs+=" tar"
-  if [[ -n "$pkgs" ]]; then
-    msg "安装依赖：$pkgs"
-    pkg_install "$pkgs" || warn "部分依赖安装失败（qrencode 不影响主流程）"
+  local pkgs=()
+  command -v curl     >/dev/null || pkgs+=("curl")
+  command -v openssl  >/dev/null || pkgs+=("openssl")
+  command -v ss       >/dev/null || case "$PM" in apt|zypper|pacman|apk) pkgs+=("iproute2");; *) pkgs+=("iproute");; esac
+  command -v tar      >/dev/null || pkgs+=("tar")
+  if ((${#pkgs[@]})); then
+    msg "安装依赖：${pkgs[*]}"
+    pkg_install "${pkgs[@]}" || die "必需依赖安装失败：${pkgs[*]}"
+  fi
+  if ! command -v qrencode >/dev/null; then
+    if pkg_available qrencode; then
+      msg "安装可选依赖：qrencode"
+      pkg_install qrencode || warn "qrencode 安装失败，仅影响二维码显示，不影响主流程"
+    else
+      warn "当前软件源未提供 qrencode，跳过二维码工具安装"
+    fi
   fi
 }
 
@@ -104,7 +125,10 @@ install_xray() {
   bash "$tmp" install ${XRAY_VERSION:+--version "$XRAY_VERSION"}
   rm -f "$tmp"
   [[ -x "$XRAY_BIN" ]] || die "Xray 安装后未找到 $XRAY_BIN"
-  ok "Xray 已安装：$($XRAY_BIN version | head -n1)"
+  local version_out version_line
+  version_out=$("$XRAY_BIN" version 2>/dev/null || true)
+  version_line=${version_out%%$'\n'*}
+  ok "Xray 已安装：${version_line:-$XRAY_BIN}"
 }
 
 uninstall_xray() {
@@ -531,19 +555,19 @@ print_result() {
 
 # ─────────────────────────── Protocol selection ───────────────────────────
 select_protocol() {
-  echo
-  printf '%s请选择协议：%s\n' "$B" "$N"
-  printf '\n%s  ─── 无需域名 ──────────────────────────────────%s\n' "$D" "$N"
-  printf '  1. VLESS + TCP + Reality    %s← 推荐，最优秀的防封锁%s\n' "$G" "$N"
-  printf '\n%s  ─── 需要域名 + 自动申请 TLS 证书 ──────────%s\n' "$D" "$N"
-  printf '  2. Shadowsocks + WS + TLS   (SS 隐藏于 HTTPS，防主动探测)\n'
-  printf '  3. VLESS + WS  + TLS        (CDN 友好)\n'
-  printf '  4. VLESS + gRPC + TLS       (CDN 友好，低延迟)\n'
-  printf '  5. VMess + WS  + TLS        (兼容性最广)\n'
-  printf '  6. VMess + gRPC + TLS\n'
-  printf '  7. Trojan + WS  + TLS\n'
-  printf '  8. Trojan + gRPC + TLS\n'
-  echo
+  echo >&2
+  printf '%s请选择协议：%s\n' "$B" "$N" >&2
+  printf '\n%s  ─── 无需域名 ──────────────────────────────────%s\n' "$D" "$N" >&2
+  printf '  1. VLESS + TCP + Reality    %s← 推荐，最优秀的防封锁%s\n' "$G" "$N" >&2
+  printf '\n%s  ─── 需要域名 + 自动申请 TLS 证书 ──────────%s\n' "$D" "$N" >&2
+  printf '  2. Shadowsocks + WS + TLS   (SS 隐藏于 HTTPS，防主动探测)\n' >&2
+  printf '  3. VLESS + WS  + TLS        (CDN 友好)\n' >&2
+  printf '  4. VLESS + gRPC + TLS       (CDN 友好，低延迟)\n' >&2
+  printf '  5. VMess + WS  + TLS        (兼容性最广)\n' >&2
+  printf '  6. VMess + gRPC + TLS\n' >&2
+  printf '  7. Trojan + WS  + TLS\n' >&2
+  printf '  8. Trojan + gRPC + TLS\n' >&2
+  echo >&2
   local choice
   while true; do
     read -r -p '  请输入选项 [1-8]: ' choice
@@ -633,8 +657,11 @@ _install_ss() {
 cmd_install() {
   require_root
   if [[ -s "$XRAY_CONFIG" && -z "${FORCE:-}" ]]; then
-    warn "已存在配置 —— 跳过。如需重建请传 FORCE=1"
-    cmd_info; return
+    if [[ -r "$XRAY_META_FILE" ]]; then
+      warn "已存在配置 —— 跳过。如需重建请传 FORCE=1"
+      cmd_info; return
+    fi
+    warn "发现 Xray 配置但缺少节点信息，将继续重建。"
   fi
   install_deps
   [[ -x "$XRAY_BIN" ]] || install_xray
