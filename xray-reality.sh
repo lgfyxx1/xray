@@ -188,8 +188,10 @@ gen_path()    { openssl rand -hex 8; }
 get_acme_email() {
   local acme_email="${ACME_EMAIL:-}"
   [[ -n "$acme_email" ]] || die "TLS 证书申请需要设置 ACME_EMAIL"
-  [[ "$acme_email" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] \
-    || die "ACME_EMAIL 格式无效，请提供真实可用邮箱"
+  acme_email="${acme_email#${acme_email%%[![:space:]]*}}"
+  acme_email="${acme_email%${acme_email##*[![:space:]]}}"
+  [[ "$acme_email" == *"@"* && "$acme_email" == *.* ]] \
+    || die "ACME_EMAIL 格式无效，请提供真实可用邮箱：${acme_email:-<empty>}"
   printf '%s' "$acme_email"
 }
 
