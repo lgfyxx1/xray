@@ -19,6 +19,7 @@ SSL_DIR="${XRAY_CONFIG_DIR}/ssl"
 ACME_SH="$HOME/.acme.sh/acme.sh"
 ACME_ACCOUNT_CONF="$HOME/.acme.sh/account.conf"
 BBR_SYSCTL_CONF="/etc/sysctl.d/99-xray-bbr.conf"
+BBR_MODULES_CONF="/etc/modules-load.d/bbr.conf"
 
 OFFICIAL_INSTALLER_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
 
@@ -111,9 +112,15 @@ enable_bbr() {
   local available_cc current_cc current_qdisc
   available_cc=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
   if [[ " $available_cc " != *" bbr "* ]]; then
+    if modprobe tcp_bbr >/dev/null 2>&1; then
+      available_cc=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+    fi
+  fi
+  if [[ " $available_cc " != *" bbr "* ]]; then
     warn "当前内核未提供 BBR，跳过启用"
     return 0
   fi
+  printf 'tcp_bbr\n' >"$BBR_MODULES_CONF"
   current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
   current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || true)
   if [[ "$current_cc" == "bbr" && "$current_qdisc" == "fq" ]]; then
@@ -140,6 +147,9 @@ cmd_bbr_status() {
   printf "可用拥塞控制：%s\n" "${available_cc:-unknown}"
   printf "当前拥塞控制：%s\n" "${current_cc:-unknown}"
   printf "当前队列调度：%s\n" "${current_qdisc:-unknown}"
+  lsmod | grep -q '^tcp_bbr' \
+    && printf "BBR 模块：已加载\n" \
+    || printf "BBR 模块：未加载\n"
 }
 
 # ─────────────────────────── Xray core ───────────────────────────
