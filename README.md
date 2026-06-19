@@ -20,6 +20,8 @@
 TLS 协议会自动通过 **acme.sh + Let's Encrypt** 申请证书，需要：
 - 域名 DNS A 记录指向服务器 IP
 - 80 端口空闲（申请证书时临时占用）
+- 如果 80 端口被 nginx 占用，可先停 nginx，或使用 `ACME_STOP_SERVICES=nginx` 让脚本申请证书时临时停启
+- TLS/CDN 协议默认监听 443；如果 nginx 也占用 443，需要先调整或停止 nginx，或改用 Cloudflare 支持的其他 HTTPS 端口
 
 ## 一键安装
 
@@ -90,6 +92,7 @@ xr edit-name    # 修改节点名称
 | `XRAY_DOMAIN=my.domain` | TLS 协议域名 |
 | `XRAY_SS_METHOD=aes-256-gcm` | Shadowsocks 加密方式 |
 | `XRAY_VERSION=v26.3.27` | 固定 Xray 版本 |
+| `ACME_STOP_SERVICES=nginx` | 申请证书前临时停止服务，申请后恢复 |
 | `FORCE=1` | 已有配置时强制重建 |
 
 ## License

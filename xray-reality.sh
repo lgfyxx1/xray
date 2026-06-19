@@ -196,16 +196,64 @@ install_acme() {
   [[ -x "$ACME_SH" ]] || die "acme.sh 安装后未找到"
 }
 
+port_users() {
+  local port=$1
+  ss -tlnpH "sport = :$port" 2>/dev/null || true
+}
+
+ensure_port_free() {
+  local port=$1 users
+  users=$(port_users "$port")
+  [[ -z "$users" ]] && return 0
+  printf '%s\n%s\n' "${port} 端口已被占用：" "$users" >&2
+  die "Xray 需要监听 ${port}/tcp。请先停止占用该端口的服务，或用 REALITY_PORT 指定其他 Cloudflare 支持的 HTTPS 端口。"
+}
+
+stop_acme_services() {
+  local stopped=() services=() svc
+  [[ -n "${ACME_STOP_SERVICES:-}" ]] || return 0
+  read -r -a services <<<"${ACME_STOP_SERVICES//,/ }"
+  for svc in "${services[@]}"; do
+    [[ -n "$svc" ]] || continue
+    if systemctl is-active --quiet "$svc"; then
+      msg "临时停止服务以申请证书：$svc"
+      systemctl stop "$svc"
+      stopped+=("$svc")
+    fi
+  done
+  ACME_STOPPED_SERVICES="${stopped[*]:-}"
+}
+
+restart_acme_services() {
+  local svc
+  [[ -n "${ACME_STOPPED_SERVICES:-}" ]] || return 0
+  for svc in $ACME_STOPPED_SERVICES; do
+    msg "恢复服务：$svc"
+    systemctl start "$svc" || warn "服务恢复失败：$svc"
+  done
+  ACME_STOPPED_SERVICES=""
+}
+
 get_cert() {
   local domain=$1
   install_acme
   mkdir -p "$SSL_DIR"
+  local users
+  users=$(port_users 80)
+  if [[ -n "$users" && -z "${ACME_STOP_SERVICES:-}" ]]; then
+    printf '%s\n%s\n' "80 端口已被占用：" "$users" >&2
+    die "证书申请需要临时占用 80 端口。可先停 nginx，或用 ACME_STOP_SERVICES=nginx 让脚本临时停启。"
+  fi
+  stop_acme_services
   msg "申请 TLS 证书：$domain（Let's Encrypt standalone 模式，需要 80 端口空闲）"
-  "$ACME_SH" --issue -d "$domain" --standalone --httpport 80 \
-    --server letsencrypt --force 2>&1 \
-  || "$ACME_SH" --issue -d "$domain" --standalone --httpport 80 \
-     --server zerossl --force 2>&1 \
-  || die "证书申请失败。请确认：1) 域名 DNS A 记录指向本机 2) 80 端口未被占用"
+  if ! "$ACME_SH" --issue -d "$domain" --standalone --httpport 80 \
+      --server letsencrypt --force 2>&1 \
+    && ! "$ACME_SH" --issue -d "$domain" --standalone --httpport 80 \
+       --server zerossl --force 2>&1; then
+    restart_acme_services
+    die "证书申请失败。请确认：1) 域名 DNS A 记录指向本机 2) 80 端口未被占用"
+  fi
+  restart_acme_services
 
   "$ACME_SH" --install-cert -d "$domain" \
     --key-file        "$SSL_DIR/privkey.pem" \
@@ -675,6 +723,7 @@ cmd_install() {
     ss-ws-tls|*-ws-tls|*-grpc-tls) PORT="${REALITY_PORT:-443}" ;;
     *)                              PORT=$(pick_port) ;;
   esac
+  ensure_port_free "$PORT"
 
   ADDR="${REALITY_ADDR:-}"
   if [[ -z "$ADDR" ]]; then
