@@ -132,6 +132,16 @@ EOF
     || warn "已写入 BBR 配置，但当前未确认生效"
 }
 
+cmd_bbr_status() {
+  local available_cc current_cc current_qdisc
+  available_cc=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+  current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
+  current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || true)
+  printf "可用拥塞控制：%s\n" "${available_cc:-unknown}"
+  printf "当前拥塞控制：%s\n" "${current_cc:-unknown}"
+  printf "当前队列调度：%s\n" "${current_qdisc:-unknown}"
+}
+
 # ─────────────────────────── Xray core ───────────────────────────
 install_xray() {
   local tmp installer_sha
@@ -878,6 +888,11 @@ cmd_restart() {
 cmd_update() {
   require_root; install_xray; systemctl restart xray; ok "Xray 已升级并重启"
 }
+cmd_enable_bbr() {
+  require_root
+  enable_bbr
+  cmd_bbr_status
+}
 cmd_delete_node() {
   require_root
   [[ -r "$XRAY_META_FILE" || -s "$XRAY_CONFIG" ]] || { warn "未检测到节点配置"; return; }
@@ -998,9 +1013,11 @@ cmd_menu() {
     printf '  8. 查看服务状态\n'
     echo
     printf '%s  ─────── 系统操作 ────────────────────────────%s\n' "$D" "$N"
-    printf '  9. 升级 Xray\n'
-    printf '  10. 删除当前节点\n'
-    printf '  11. 卸载 Xray\n'
+    printf '  9. 查看 BBR 状态\n'
+    printf '  10. 启用 BBR\n'
+    printf '  11. 升级 Xray\n'
+    printf '  12. 删除当前节点\n'
+    printf '  13. 卸载 Xray\n'
     echo
     printf '  0. 退出\n\n'
 
@@ -1014,9 +1031,11 @@ cmd_menu() {
       6)  cmd_restart ;;
       7)  cmd_logs 50 ;;
       8)  cmd_status ;;
-      9)  cmd_update ;;
-      10) cmd_delete_node ;;
-      11) cmd_uninstall; return ;;
+      9)  cmd_bbr_status ;;
+      10) cmd_enable_bbr ;;
+      11) cmd_update ;;
+      12) cmd_delete_node ;;
+      13) cmd_uninstall; return ;;
       0)  break ;;
       *)  warn "无效选项" ;;
     esac
@@ -1052,6 +1071,8 @@ ${B}${SCRIPT_NAME} v${SCRIPT_VERSION}${N}  —  多协议 Xray 一键脚本
   xr info          节点信息 + 分享链接 + 二维码
   xr status        Xray 服务状态
   xr logs [N]      最近 N 条日志（默认 50）
+  xr bbr           查看 BBR 状态
+  xr enable-bbr    启用 BBR
   xr restart       重启 Xray
   xr update        升级 Xray
   xr delete-node   删除当前节点配置
@@ -1088,6 +1109,8 @@ main() {
     info|link|show)   cmd_info ;;
     status)           cmd_status ;;
     logs)             shift || true; cmd_logs "${1:-50}" ;;
+    bbr)              cmd_bbr_status ;;
+    enable-bbr)       cmd_enable_bbr ;;
     restart)          cmd_restart ;;
     update|upgrade)   cmd_update ;;
     delete-node)      cmd_delete_node ;;

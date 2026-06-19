@@ -81,6 +81,8 @@ xr              # 打开交互式管理菜单
 xr info         # 节点信息 + 分享链接 + 二维码
 xr status       # 服务状态
 xr logs [N]     # 最近 N 条日志
+xr bbr          # 查看 BBR 状态
+xr enable-bbr   # 启用 BBR
 xr restart      # 重启
 xr update       # 升级 Xray
 xr delete-node  # 删除当前节点配置，保留 Xray 程序
