@@ -17,6 +17,7 @@ XRAY_SHARE_FILE="${XRAY_CONFIG_DIR}/.share.txt"
 XRAY_META_FILE="${XRAY_CONFIG_DIR}/.meta.env"
 SSL_DIR="${XRAY_CONFIG_DIR}/ssl"
 ACME_SH="$HOME/.acme.sh/acme.sh"
+ACME_EMAIL_DEFAULT="admin@example.com"
 
 OFFICIAL_INSTALLER_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
 
@@ -188,8 +189,10 @@ gen_path()    { openssl rand -hex 8; }
 # ─────────────────────────── TLS cert (acme.sh) ───────────────────────────
 install_acme() {
   [[ -x "$ACME_SH" ]] && return
+  local acme_email="${ACME_EMAIL:-$ACME_EMAIL_DEFAULT}"
+  [[ "$acme_email" == *.*@*.* ]] || die "ACME_EMAIL 格式无效，请提供真实可用邮箱"
   msg "安装 acme.sh..."
-  curl -fsSL https://get.acme.sh | sh -s email=admin@xray.local >/dev/null 2>&1 \
+  curl -fsSL https://get.acme.sh | sh -s email="$acme_email" >/dev/null 2>&1 \
     || die "acme.sh 安装失败"
   # Reload path
   ACME_SH="$HOME/.acme.sh/acme.sh"

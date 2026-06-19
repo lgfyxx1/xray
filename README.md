@@ -34,7 +34,7 @@ Cloudflare DNS 验证示例：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/lgfyxx1/xray/main/xray-reality.sh -o /tmp/xr.sh
-CF_Token=your_cloudflare_api_token ACME_DNS=cloudflare REALITY_PORT=8443 FORCE=1 bash /tmp/xr.sh
+ACME_EMAIL=you@example.com CF_Token=your_cloudflare_api_token ACME_DNS=cloudflare REALITY_PORT=8443 FORCE=1 bash /tmp/xr.sh
 ```
 
 安装时会弹出协议选择菜单。
@@ -100,6 +100,7 @@ xr edit-name    # 修改节点名称
 | `XRAY_DOMAIN=my.domain` | TLS 协议域名 |
 | `XRAY_SS_METHOD=aes-256-gcm` | Shadowsocks 加密方式 |
 | `XRAY_VERSION=v26.3.27` | 固定 Xray 版本 |
+| `ACME_EMAIL=you@example.com` | acme.sh 注册 ACME 账户使用的真实邮箱 |
 | `ACME_DNS=cloudflare` | 使用 Cloudflare DNS API 做证书验证，不占用 80 端口 |
 | `ACME_STOP_SERVICES=nginx` | 申请证书前临时停止服务，申请后恢复 |
 | `CF_Token=...` | Cloudflare API Token，供 `dns_cf` 验证使用 |
