@@ -210,6 +210,15 @@ install_acme() {
 ensure_acme_account() {
   local server=$1
   local acme_email; acme_email=$(get_acme_email)
+  local ca_dir=""
+  case "$server" in
+    letsencrypt) ca_dir="$HOME/.acme.sh/ca/acme-v02.api.letsencrypt.org" ;;
+    zerossl)     ca_dir="$HOME/.acme.sh/ca/acme.zerossl.com" ;;
+  esac
+  if [[ -n "$ca_dir" && -f "$ca_dir/account.conf" ]] && grep -q "xray.local" "$ca_dir/account.conf" 2>/dev/null; then
+    warn "检测到旧的 ACME 联系邮箱缓存，正在重置：$ca_dir"
+    rm -rf "$ca_dir"
+  fi
   msg "同步 ACME 账户邮箱：$acme_email"
   "$ACME_SH" --server "$server" --register-account -m "$acme_email" 2>&1 \
     || "$ACME_SH" --server "$server" --update-account -m "$acme_email" 2>&1 \
