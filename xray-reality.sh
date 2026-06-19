@@ -17,7 +17,6 @@ XRAY_SHARE_FILE="${XRAY_CONFIG_DIR}/.share.txt"
 XRAY_META_FILE="${XRAY_CONFIG_DIR}/.meta.env"
 SSL_DIR="${XRAY_CONFIG_DIR}/ssl"
 ACME_SH="$HOME/.acme.sh/acme.sh"
-ACME_EMAIL_DEFAULT="admin@example.com"
 
 OFFICIAL_INSTALLER_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
 
@@ -186,17 +185,32 @@ gen_uuid()    { "$XRAY_BIN" uuid; }
 gen_password() { openssl rand -hex 16; }
 gen_path()    { openssl rand -hex 8; }
 
+get_acme_email() {
+  local acme_email="${ACME_EMAIL:-}"
+  [[ -n "$acme_email" ]] || die "TLS 证书申请需要设置 ACME_EMAIL"
+  [[ "$acme_email" == *.*@*.* ]] || die "ACME_EMAIL 格式无效，请提供真实可用邮箱"
+  printf '%s' "$acme_email"
+}
+
 # ─────────────────────────── TLS cert (acme.sh) ───────────────────────────
 install_acme() {
   [[ -x "$ACME_SH" ]] && return
-  local acme_email="${ACME_EMAIL:-$ACME_EMAIL_DEFAULT}"
-  [[ "$acme_email" == *.*@*.* ]] || die "ACME_EMAIL 格式无效，请提供真实可用邮箱"
+  local acme_email; acme_email=$(get_acme_email)
   msg "安装 acme.sh..."
   curl -fsSL https://get.acme.sh | sh -s email="$acme_email" >/dev/null 2>&1 \
     || die "acme.sh 安装失败"
   # Reload path
   ACME_SH="$HOME/.acme.sh/acme.sh"
   [[ -x "$ACME_SH" ]] || die "acme.sh 安装后未找到"
+}
+
+ensure_acme_account() {
+  local server=$1
+  local acme_email; acme_email=$(get_acme_email)
+  msg "同步 ACME 账户邮箱：$acme_email"
+  "$ACME_SH" --server "$server" --register-account -m "$acme_email" 2>&1 \
+    || "$ACME_SH" --server "$server" --update-account -m "$acme_email" 2>&1 \
+    || die "ACME 账户初始化失败，请检查 ACME_EMAIL 是否为真实可用邮箱"
 }
 
 port_users() {
@@ -246,11 +260,13 @@ get_cert() {
     [[ -n "${CF_Zone_ID:-}" ]] || warn "未设置 CF_Zone_ID，acme.sh 将自动解析 Zone"
     [[ -n "${CF_Account_ID:-}" ]] || warn "未设置 CF_Account_ID，通常可继续，但建议显式提供"
     msg "申请 TLS 证书：$domain（Cloudflare DNS 验证，不占用 80 端口）"
+    ensure_acme_account letsencrypt
     if ! CF_Token="${CF_Token}" \
          CF_Zone_ID="${CF_Zone_ID:-}" \
          CF_Account_ID="${CF_Account_ID:-}" \
          "$ACME_SH" --issue --dns dns_cf -d "$domain" \
            --server letsencrypt --force 2>&1 \
+      && ! ensure_acme_account zerossl \
       && ! CF_Token="${CF_Token}" \
          CF_Zone_ID="${CF_Zone_ID:-}" \
          CF_Account_ID="${CF_Account_ID:-}" \
@@ -267,8 +283,10 @@ get_cert() {
     fi
     stop_acme_services
     msg "申请 TLS 证书：$domain（Let's Encrypt standalone 模式，需要 80 端口空闲）"
+    ensure_acme_account letsencrypt
     if ! "$ACME_SH" --issue -d "$domain" --standalone --httpport 80 \
         --server letsencrypt --force 2>&1 \
+      && ! ensure_acme_account zerossl \
       && ! "$ACME_SH" --issue -d "$domain" --standalone --httpport 80 \
          --server zerossl --force 2>&1; then
       restart_acme_services
