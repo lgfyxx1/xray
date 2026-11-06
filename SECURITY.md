@@ -47,4 +47,4 @@ XRAY_TEST_BIN=/path/to/verified/official/xray python3 -m unittest discover -s te
 
 回归覆盖元数据命令注入、JSON 迁移、非法字段/控制字符/端口/域名、Unicode/IPv6 链接、稳定版/下载源限制及校验失败。八种协议由真实官方核心执行 run -test，测试证书仅在临时目录生成。
 
-GitHub Actions 在 Ubuntu 22.04/24.04 执行检查，并在临时 Ubuntu 24.04 runner 实际调用官方安装器，验证 systemd、用户/文件权限、故障回滚和重复升级保留凭据。CI 不签发公网证书，也不代表八种客户端/CDN 的端到端兼容性测试。
+GitHub Actions 在 Ubuntu 22.04/24.04 执行检查，并在临时 Ubuntu 24.04 runner 实际调用官方安装器，验证 systemd、用户/文件权限、REALITY/Vision 客户端代理访问公网 HTTPS、故障回滚和重复升级保留凭据。CI 不签发公网证书，也不代表八种客户端/CDN 的端到端兼容性测试。

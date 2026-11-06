@@ -30,6 +30,7 @@ OFFICIAL_INSTALLER_URL="https://raw.githubusercontent.com/XTLS/Xray-install/${OF
 MIN_XRAY_VERSION="26.10.31"
 WORK_DIR="" TRANSACTION="" WAS_ACTIVE=0 WAS_ENABLED=0
 ACME_STOPPED_SERVICES=()
+ACME_REQUESTED_SERVICES=()
 
 DEFAULT_DESTS=(
   "www.microsoft.com" "addons.mozilla.org" "www.lovelive-anime.jp"
@@ -62,27 +63,30 @@ ensure_work() {
   [[ -n "$WORK_DIR" ]] || WORK_DIR=$(mktemp -d)
 }
 cleanup() {
-  local rc=$?
+  local rc=$? restore_failed=0
   trap - EXIT ERR INT TERM
+  set +e
   if [[ -n "$TRANSACTION" ]]; then
     warn "操作失败，恢复更新前的核心、配置和服务文件。"
     systemctl stop xray >/dev/null 2>&1 || true
     local path
     while IFS= read -r path; do
-      rm -rf -- "/${path:?}"
+      rm -rf -- "/${path:?}" || restore_failed=1
       if [[ -e "$TRANSACTION/root/$path" ]]; then
         mkdir -p "$(dirname "/$path")"
-        cp -a -- "$TRANSACTION/root/$path" "/$path" || rc=1
+        cp -a -- "$TRANSACTION/root/$path" "/$path" || restore_failed=1
       fi
     done < "$TRANSACTION/paths"
-    systemctl daemon-reload || rc=1
-    if (( WAS_ENABLED )); then systemctl enable xray >/dev/null 2>&1 || rc=1
+    systemctl daemon-reload || restore_failed=1
+    if (( WAS_ENABLED )); then systemctl enable xray >/dev/null 2>&1 || restore_failed=1
     else systemctl disable xray >/dev/null 2>&1 || true; fi
-    if (( WAS_ACTIVE )); then systemctl start xray || rc=1; fi
+    if (( WAS_ACTIVE )); then systemctl start xray || restore_failed=1; fi
     rc=1
   fi
   restart_acme_services || rc=1
-  [[ -z "$WORK_DIR" ]] || rm -rf -- "$WORK_DIR"
+  if (( restore_failed )); then
+    err "回滚未完全成功，备份保留在：$TRANSACTION"
+  elif [[ -n "$WORK_DIR" ]]; then rm -rf -- "$WORK_DIR"; fi
   exit "$rc"
 }
 trap cleanup EXIT
@@ -397,6 +401,7 @@ stop_acme_services() {
   IFS=', ' read -r -a services <<< "${ACME_STOP_SERVICES:-}"
   for svc in "${services[@]}"; do
     [[ "$svc" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.@-]*$ && "$svc" != xray* ]] || die "ACME_STOP_SERVICES 包含无效服务名"
+    ACME_REQUESTED_SERVICES+=("$svc")
     if systemctl is-active --quiet "$svc"; then
       ACME_STOPPED_SERVICES+=("$svc")
       systemctl stop "$svc"
@@ -413,8 +418,8 @@ set -eu
 umask 077
 : > /run/xray-cert-stopped-services
 EOF
-  if [[ -n "${ACME_STOPPED_SERVICES[*]:-}" ]]; then
-  for svc in "${ACME_STOPPED_SERVICES[@]}"; do
+  if [[ -n "${ACME_REQUESTED_SERVICES[*]:-}" ]]; then
+  for svc in "${ACME_REQUESTED_SERVICES[@]}"; do
     # service names were validated before stopping them
     printf 'if systemctl is-active --quiet %s; then\n  printf "%%s\\n" %s >> /run/xray-cert-stopped-services\n  systemctl stop %s\nfi\n' \
       "$svc" "$svc" "$svc" >> "$CERT_PRE_HOOK"
