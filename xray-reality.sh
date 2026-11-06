@@ -7,7 +7,7 @@ IFS=$'\n\t'
 umask 077
 
 SCRIPT_NAME="xray-reality"
-SCRIPT_VERSION="2.1.0"
+SCRIPT_VERSION="3.0.0"
 
 XRAY_BIN="/usr/local/bin/xray"
 SELF_CMD="/usr/local/bin/xr"
@@ -16,12 +16,21 @@ XRAY_CONFIG="${XRAY_CONFIG_DIR}/config.json"
 XRAY_SHARE_FILE="${XRAY_CONFIG_DIR}/.share.txt"
 XRAY_META_FILE="${XRAY_CONFIG_DIR}/.meta.env"
 SSL_DIR="${XRAY_CONFIG_DIR}/ssl"
-ACME_SH="$HOME/.acme.sh/acme.sh"
-ACME_ACCOUNT_CONF="$HOME/.acme.sh/account.conf"
+CERT_HOOK="/etc/letsencrypt/renewal-hooks/deploy/xray-cert"
+CF_CREDENTIALS="/etc/letsencrypt/xray-cloudflare.ini"
+CERT_PRE_HOOK="/etc/letsencrypt/xray-standalone-pre"
+CERT_POST_HOOK="/etc/letsencrypt/xray-standalone-post"
 BBR_SYSCTL_CONF="/etc/sysctl.d/99-xray-bbr.conf"
 BBR_MODULES_CONF="/etc/modules-load.d/bbr.conf"
 
-OFFICIAL_INSTALLER_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
+# Audited official installer; never execute a moving branch as root.
+OFFICIAL_INSTALLER_COMMIT="04e6f3bd9534811ed901a48c47b2c042dd64eb3a"
+OFFICIAL_INSTALLER_SHA256="934ecb26ded1089f849ac238d5170f1159fe4b6ca300d4f1e67730bd41fe58cf"
+OFFICIAL_INSTALLER_URL="https://raw.githubusercontent.com/XTLS/Xray-install/${OFFICIAL_INSTALLER_COMMIT}/install-release.sh"
+MIN_XRAY_VERSION="26.10.31"
+WORK_DIR="" TRANSACTION="" WAS_ACTIVE=0 WAS_ENABLED=0
+ACME_STOPPED_SERVICES=()
+ACME_REQUESTED_SERVICES=()
 
 DEFAULT_DESTS=(
   "www.microsoft.com" "addons.mozilla.org" "www.lovelive-anime.jp"
@@ -46,8 +55,86 @@ err()  { printf '%s\n' "${R}[x]${N} $*" >&2; }
 die()  { err "$*"; exit 1; }
 trap 'err "脚本第 $LINENO 行异常，已中止。"' ERR
 
+https_get() {
+  curl -q --fail --silent --show-error --location --proto '=https' \
+    --proto-redir '=https' --tlsv1.2 --retry 3 --connect-timeout 10 --max-time 180 "$@"
+}
+ensure_work() {
+  [[ -n "$WORK_DIR" ]] || WORK_DIR=$(mktemp -d)
+}
+cleanup() {
+  local rc=$? restore_failed=0
+  trap - EXIT ERR INT TERM
+  set +e
+  if [[ -n "$TRANSACTION" ]]; then
+    warn "操作失败，恢复更新前的核心、配置和服务文件。"
+    systemctl stop xray >/dev/null 2>&1 || true
+    local path
+    while IFS= read -r path; do
+      rm -rf -- "/${path:?}" || restore_failed=1
+      if [[ -e "$TRANSACTION/root/$path" ]]; then
+        mkdir -p "$(dirname "/$path")"
+        cp -a -- "$TRANSACTION/root/$path" "/$path" || restore_failed=1
+      fi
+    done < "$TRANSACTION/paths"
+    systemctl daemon-reload || restore_failed=1
+    if (( WAS_ENABLED )); then systemctl enable xray >/dev/null 2>&1 || restore_failed=1
+    else systemctl disable xray >/dev/null 2>&1 || true; fi
+    if (( WAS_ACTIVE )); then systemctl start xray || restore_failed=1; fi
+    rc=1
+  fi
+  restart_acme_services || rc=1
+  if (( restore_failed )); then
+    err "回滚未完全成功，备份保留在：$TRANSACTION"
+  elif [[ -n "$WORK_DIR" ]]; then rm -rf -- "$WORK_DIR"; fi
+  exit "$rc"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+begin_transaction() {
+  ensure_work
+  [[ -z "$TRANSACTION" ]] || return 0
+  local backup="$WORK_DIR/rollback" path
+  mkdir -p "$backup/root"
+  systemctl is-active --quiet xray && WAS_ACTIVE=1 || WAS_ACTIVE=0
+  systemctl is-enabled --quiet xray && WAS_ENABLED=1 || WAS_ENABLED=0
+  for path in usr/local/bin/xray usr/local/share/xray usr/local/etc/xray \
+      etc/systemd/system/xray.service etc/systemd/system/xray@.service \
+      etc/systemd/system/xray.service.d etc/systemd/system/xray@.service.d \
+      etc/letsencrypt/renewal-hooks/deploy/xray-cert \
+      etc/letsencrypt/xray-cloudflare.ini etc/letsencrypt/xray-standalone-pre \
+      etc/letsencrypt/xray-standalone-post; do
+    printf '%s\n' "$path" >> "$backup/paths"
+    if [[ -e "/$path" ]]; then
+      mkdir -p "$backup/root/$(dirname "$path")"
+      cp -a -- "/$path" "$backup/root/$path"
+    fi
+  done
+  TRANSACTION="$backup"
+}
+commit_transaction() { TRANSACTION=""; }
+
+preflight() {
+  [[ $(uname -s) == Linux && -d /run/systemd/system ]] || die "仅支持使用 systemd 的 Linux"
+  (( BASH_VERSINFO[0] >= 4 )) || die "需要 Bash 4 或更新版本"
+  # One writer at a time; keep the lock until process exit.
+  command -v flock >/dev/null || die "请先安装 util-linux（flock）"
+  exec 9>/run/lock/xray-manager.lock
+  flock -n 9 || die "另一个 xr 管理进程正在运行"
+  # Reject symlinks at managed paths before root opens predictable filenames.
+  local path
+  for path in "$XRAY_CONFIG_DIR" "$XRAY_CONFIG" "$XRAY_META_FILE" "$XRAY_SHARE_FILE" \
+      "$SSL_DIR" "$SSL_DIR/privkey.pem" "$SSL_DIR/fullchain.pem" "$SELF_CMD" \
+      "$CERT_HOOK" "$CF_CREDENTIALS" "$CERT_PRE_HOOK" "$CERT_POST_HOOK"; do
+    [[ ! -L "$path" ]] || die "拒绝写入符号链接：$path"
+  done
+}
+
+
 # ─────────────────────────── Preflight ───────────────────────────
-require_root() { [[ $EUID -eq 0 ]] || die "请使用 root 权限执行（sudo bash $0 $*）"; }
+require_root() { [[ $EUID -eq 0 ]] || die "请使用 root 权限执行（sudo bash $0）"; }
 
 detect_pm() {
   if   command -v apt-get >/dev/null; then PM=apt
@@ -55,8 +142,7 @@ detect_pm() {
   elif command -v yum     >/dev/null; then PM=yum
   elif command -v zypper  >/dev/null; then PM=zypper
   elif command -v pacman  >/dev/null; then PM=pacman
-  elif command -v apk     >/dev/null; then PM=apk
-  else die "未检测到受支持的包管理器（apt/dnf/yum/zypper/pacman/apk）"
+  else die "未检测到受支持的包管理器（apt/dnf/yum/zypper/pacman）"
   fi
 }
 
@@ -69,8 +155,7 @@ pkg_install() {
     dnf)    dnf install -y -q "${pkgs[@]}" >/dev/null ;;
     yum)    yum install -y -q "${pkgs[@]}" >/dev/null ;;
     zypper) zypper --non-interactive install -y "${pkgs[@]}" >/dev/null ;;
-    pacman) pacman -Sy --noconfirm --needed "${pkgs[@]}" >/dev/null ;;
-    apk)    apk add --no-cache "${pkgs[@]}" >/dev/null ;;
+    pacman) pacman -S --noconfirm --needed "${pkgs[@]}" >/dev/null ;;
   esac
 }
 
@@ -82,8 +167,7 @@ pkg_available() {
     dnf)    dnf -q repoquery "$pkg" >/dev/null 2>&1 ;;
     yum)    yum -q list available "$pkg" >/dev/null 2>&1 ;;
     zypper) zypper --non-interactive search -x "$pkg" >/dev/null 2>&1 ;;
-    pacman) pacman -Sy >/dev/null 2>&1 && pacman -Si "$pkg" >/dev/null 2>&1 ;;
-    apk)    apk search -e "$pkg" >/dev/null 2>&1 ;;
+    pacman) pacman -Si "$pkg" >/dev/null 2>&1 ;;
   esac
 }
 
@@ -92,8 +176,12 @@ install_deps() {
   local pkgs=()
   command -v curl     >/dev/null || pkgs+=("curl")
   command -v openssl  >/dev/null || pkgs+=("openssl")
-  command -v ss       >/dev/null || case "$PM" in apt|zypper|pacman|apk) pkgs+=("iproute2");; *) pkgs+=("iproute");; esac
-  command -v tar      >/dev/null || pkgs+=("tar")
+  command -v ss       >/dev/null || case "$PM" in apt|zypper|pacman) pkgs+=("iproute2");; *) pkgs+=("iproute");; esac
+  command -v python3  >/dev/null || pkgs+=("python3")
+  command -v unzip    >/dev/null || pkgs+=("unzip")
+  command -v sha256sum >/dev/null || pkgs+=("coreutils")
+  command -v runuser  >/dev/null || pkgs+=("util-linux")
+  [[ -s /etc/ssl/certs/ca-certificates.crt || -s /etc/pki/tls/certs/ca-bundle.crt ]] || pkgs+=("ca-certificates")
   if ((${#pkgs[@]})); then
     msg "安装依赖：${pkgs[*]}"
     pkg_install "${pkgs[@]}" || die "必需依赖安装失败：${pkgs[*]}"
@@ -131,12 +219,14 @@ enable_bbr() {
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 EOF
-  sysctl --system >/dev/null 2>&1 || die "应用 BBR sysctl 配置失败"
+  sysctl -p "$BBR_SYSCTL_CONF" >/dev/null 2>&1 || die "应用 BBR sysctl 配置失败"
   current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
   current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || true)
-  [[ "$current_cc" == "bbr" && "$current_qdisc" == "fq" ]] \
-    && ok "已启用 BBR 加速" \
-    || warn "已写入 BBR 配置，但当前未确认生效"
+  if [[ "$current_cc" == "bbr" && "$current_qdisc" == "fq" ]]; then
+    ok "已启用 BBR 加速"
+  else
+    warn "已写入 BBR 配置，但当前未确认生效"
+  fi
 }
 
 cmd_bbr_status() {
@@ -153,49 +243,80 @@ cmd_bbr_status() {
 }
 
 # ─────────────────────────── Xray core ───────────────────────────
+download_installer() {
+  ensure_work
+  https_get "$OFFICIAL_INSTALLER_URL" -o "$WORK_DIR/install-release.sh"
+  printf '%s  %s\n' "$OFFICIAL_INSTALLER_SHA256" "$WORK_DIR/install-release.sh" | sha256sum -c - >/dev/null \
+    || die "官方安装器 SHA256 校验失败，拒绝执行"
+}
+
 install_xray() {
-  local tmp installer_sha
-  tmp=$(mktemp); chmod 600 "$tmp"
-  msg "下载官方安装脚本（HTTPS + TLS1.2+）"
-  curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --max-time 30 \
-       "$OFFICIAL_INSTALLER_URL" -o "$tmp" \
-    || { rm -f "$tmp"; die "无法下载官方安装脚本"; }
-  installer_sha=$(sha256sum "$tmp" | awk '{print $1}')
-  printf '%s    %s\n' "$installer_sha" "$OFFICIAL_INSTALLER_URL" >&2
-  if [[ -n "${XRAY_INSTALLER_SHA256:-}" ]]; then
-    [[ "$installer_sha" == "$XRAY_INSTALLER_SHA256" ]] \
-      || { rm -f "$tmp"; die "SHA256 校验不符，疑似中间人或上游变更"; }
-    ok "官方安装脚本 SHA256 校验通过"
-  else
-    warn "未提供 XRAY_INSTALLER_SHA256（建议钉住以加固安全）"
+  ensure_work
+  local machine release_url version url digest archive
+  case $(uname -m) in
+    x86_64|amd64) machine=64 ;;
+    aarch64|arm64) machine=arm64-v8a ;;
+    *) die "本管理脚本已验证的架构为 x86_64 和 aarch64" ;;
+  esac
+  release_url="https://api.github.com/repos/XTLS/Xray-core/releases/latest"
+  if [[ -n "${XRAY_VERSION:-}" ]]; then
+    [[ "$XRAY_VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "XRAY_VERSION 格式无效"
+    release_url="https://api.github.com/repos/XTLS/Xray-core/releases/tags/v${XRAY_VERSION#v}"
   fi
-  bash "$tmp" install ${XRAY_VERSION:+--version "$XRAY_VERSION"}
-  rm -f "$tmp"
-  [[ -x "$XRAY_BIN" ]] || die "Xray 安装后未找到 $XRAY_BIN"
-  local version_out version_line
-  version_out=$("$XRAY_BIN" version 2>/dev/null || true)
-  version_line=${version_out%%$'\n'*}
-  ok "Xray 已安装：${version_line:-$XRAY_BIN}"
+  https_get "$release_url" -o "$WORK_DIR/release.json"
+  state_tool release "$WORK_DIR/release.json" "$machine" "$MIN_XRAY_VERSION" > "$WORK_DIR/release.txt"
+  { IFS= read -r version; IFS= read -r url; IFS= read -r digest; } < "$WORK_DIR/release.txt"
+  archive="$WORK_DIR/Xray-linux-$machine.zip"
+  msg "下载官方稳定版 $version，校验 GitHub Release SHA256"
+  https_get "$url" -o "$archive"
+  printf '%s  %s\n' "$digest" "$archive" | sha256sum -c - >/dev/null || die "核心压缩包 SHA256 校验失败"
+  # The pinned official installer also verifies this local digest.
+  printf 'SHA256= %s\n' "$digest" > "$archive.dgst"
+  download_installer
+  # Candidate config check before touching the installed binary.
+  mkdir -p "$WORK_DIR/candidate"
+  unzip -q "$archive" -d "$WORK_DIR/candidate"
+  chmod 755 "$WORK_DIR/candidate/xray"
+  if [[ -s "$XRAY_CONFIG" ]]; then
+    XRAY_LOCATION_ASSET="$WORK_DIR/candidate" "$WORK_DIR/candidate/xray" run -test -config "$XRAY_CONFIG"
+  fi
+  # This wrapper owns a single managed service, not third-party/multi-instance setups.
+  if systemctl list-units --state=active --no-legend 'xray@*' | grep -q .; then
+    die "检测到其他运行中的 Xray 实例，请分别维护，拒绝影响它们"
+  fi
+  begin_transaction
+  # Explicit paths prevent caller environment from redirecting root writes.
+  env -u JSONS_PATH JSON_PATH="$XRAY_CONFIG_DIR" DAT_PATH=/usr/local/share/xray \
+    bash "$WORK_DIR/install-release.sh" install --local "$archive" --manually-restart-later
+  [[ -x "$XRAY_BIN" ]] || die "官方安装后未找到核心"
+  [[ $("$XRAY_BIN" version | awk 'NR==1 {print $2}') == "${version#v}" ]] || die "安装后的版本不符"
 }
 
 uninstall_xray() {
-  local tmp; tmp=$(mktemp); chmod 600 "$tmp"
-  curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --max-time 30 \
-       "$OFFICIAL_INSTALLER_URL" -o "$tmp" || die "无法下载官方卸载脚本"
-  bash "$tmp" remove --purge || true
-  rm -f "$tmp" "$XRAY_SHARE_FILE" "$XRAY_META_FILE"
+  download_installer
+  env -u JSONS_PATH JSON_PATH="$XRAY_CONFIG_DIR" DAT_PATH=/usr/local/share/xray \
+    bash "$WORK_DIR/install-release.sh" remove --purge
+  remove_cert_automation
 }
+
+remove_cert_automation() {
+  systemctl disable --now xray-cert-renew.timer >/dev/null 2>&1 || true
+  rm -f "$CERT_HOOK" "$CF_CREDENTIALS" "$CERT_PRE_HOOK" "$CERT_POST_HOOK" \
+    /etc/systemd/system/xray-cert-renew.service /etc/systemd/system/xray-cert-renew.timer
+  systemctl daemon-reload
+}
+
 
 # ─────────────────────────── Network / Crypto ───────────────────────────
 get_public_ip() {
   local ip
   for s in api.ipify.org ipv4.icanhazip.com ifconfig.me; do
-    ip=$(curl -fsS --proto '=https' --tlsv1.2 --max-time 4 "https://${s}" 2>/dev/null | tr -d '[:space:]') || continue
+    ip=$(curl -q -fsS --proto '=https' --tlsv1.2 --max-time 4 "https://${s}" 2>/dev/null | tr -d '[:space:]') || continue
     [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && { echo "$ip"; return; }
   done
   for s in api64.ipify.org ifconfig.co; do
-    ip=$(curl -fsS --proto '=https' --tlsv1.2 --max-time 4 "https://${s}" 2>/dev/null | tr -d '[:space:]') || continue
-    [[ -n "$ip" ]] && { echo "$ip"; return; }
+    ip=$(curl -q -fsS --proto '=https' --tlsv1.2 --max-time 4 "https://${s}" 2>/dev/null | tr -d '[:space:]') || continue
+    if python3 -c 'import ipaddress,sys; ipaddress.ip_address(sys.argv[1])' "$ip" 2>/dev/null; then echo "$ip"; return; fi
   done
   echo ""
 }
@@ -234,8 +355,8 @@ gen_path()    { openssl rand -hex 8; }
 
 trim_spaces() {
   local s=${1-}
-  s="${s#${s%%[![:space:]]*}}"
-  s="${s%${s##*[![:space:]]}}"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
   printf '%s' "$s"
 }
 
@@ -243,6 +364,7 @@ normalize_domain() {
   local domain
   domain=$(trim_spaces "${1-}")
   domain=${domain%.}
+  state_tool domain "$domain" >/dev/null || die "域名格式无效"
   printf '%s' "$domain"
 }
 
@@ -259,6 +381,7 @@ read_domain_or_die() {
     read -r -p "  确认无误？[Y/n]: " confirm
     [[ "${confirm:-Y}" =~ ^[Yy]$ ]] || die "已取消，请重新执行并输入正确域名"
   fi
+  state_tool domain "$domain" >/dev/null || die "域名格式无效"
   printf '%s' "$domain"
 }
 
@@ -271,390 +394,347 @@ get_acme_email() {
   printf '%s' "$acme_email"
 }
 
-# ─────────────────────────── TLS cert (acme.sh) ───────────────────────────
-install_acme() {
-  [[ -x "$ACME_SH" ]] && return
-  local acme_email; acme_email=$(get_acme_email)
-  msg "安装 acme.sh..."
-  curl -fsSL https://get.acme.sh | sh -s email="$acme_email" >/dev/null 2>&1 \
-    || die "acme.sh 安装失败"
-  # Reload path
-  ACME_SH="$HOME/.acme.sh/acme.sh"
-  [[ -x "$ACME_SH" ]] || die "acme.sh 安装后未找到"
-}
-
-ensure_acme_account() {
-  local server=$1
-  local acme_email; acme_email=$(get_acme_email)
-  local ca_dir=""
-  case "$server" in
-    letsencrypt) ca_dir="$HOME/.acme.sh/ca/acme-v02.api.letsencrypt.org" ;;
-    zerossl)     ca_dir="$HOME/.acme.sh/ca/acme.zerossl.com" ;;
-  esac
-  if [[ -n "$ca_dir" && -f "$ca_dir/account.conf" ]] && grep -q "xray.local" "$ca_dir/account.conf" 2>/dev/null; then
-    warn "检测到旧的 ACME 联系邮箱缓存，正在重置：$ca_dir"
-    rm -rf "$ca_dir"
-  fi
-  mkdir -p "$(dirname "$ACME_ACCOUNT_CONF")"
-  if [[ -f "$ACME_ACCOUNT_CONF" ]]; then
-    sed -i.bak "/^ACCOUNT_EMAIL=/d" "$ACME_ACCOUNT_CONF" 2>/dev/null || true
-  fi
-  printf "ACCOUNT_EMAIL='%s'\n" "$acme_email" >>"$ACME_ACCOUNT_CONF"
-  msg "同步 ACME 账户邮箱：$acme_email"
-  "$ACME_SH" --server "$server" --register-account 2>&1 \
-    || "$ACME_SH" --server "$server" --update-account -m "$acme_email" 2>&1 \
-    || die "ACME 账户初始化失败，请检查 ACME_EMAIL 是否为真实可用邮箱"
-}
-
-port_users() {
-  local port=$1
-  ss -tlnpH "sport = :$port" 2>/dev/null || true
-}
-
-ensure_port_free() {
-  local port=$1 users
-  users=$(port_users "$port")
-  [[ -z "$users" ]] && return 0
-  printf '%s\n%s\n' "${port} 端口已被占用：" "$users" >&2
-  die "Xray 需要监听 ${port}/tcp。请先停止占用该端口的服务，或用 REALITY_PORT 指定其他 Cloudflare 支持的 HTTPS 端口。"
-}
-
+# ─────────────────────────── TLS certificates ───────────────────────────
+# Certificates come from distro-packaged Certbot, not a downloaded shell pipeline.
 stop_acme_services() {
-  local stopped=() services=() svc
-  [[ -n "${ACME_STOP_SERVICES:-}" ]] || return 0
-  read -r -a services <<<"${ACME_STOP_SERVICES//,/ }"
+  local svc services=()
+  IFS=', ' read -r -a services <<< "${ACME_STOP_SERVICES:-}"
   for svc in "${services[@]}"; do
-    [[ -n "$svc" ]] || continue
+    [[ "$svc" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.@-]*$ && "$svc" != xray* ]] || die "ACME_STOP_SERVICES 包含无效服务名"
+    ACME_REQUESTED_SERVICES+=("$svc")
     if systemctl is-active --quiet "$svc"; then
-      msg "临时停止服务以申请证书：$svc"
+      ACME_STOPPED_SERVICES+=("$svc")
       systemctl stop "$svc"
-      stopped+=("$svc")
     fi
   done
-  ACME_STOPPED_SERVICES="${stopped[*]:-}"
 }
 
-restart_acme_services() {
+write_standalone_hooks() {
   local svc
-  [[ -n "${ACME_STOPPED_SERVICES:-}" ]] || return 0
-  for svc in $ACME_STOPPED_SERVICES; do
-    msg "恢复服务：$svc"
-    systemctl start "$svc" || warn "服务恢复失败：$svc"
+  install -d -m 700 /etc/letsencrypt
+  cat > "$CERT_PRE_HOOK" <<'EOF'
+#!/bin/sh
+set -eu
+umask 077
+: > /run/xray-cert-stopped-services
+EOF
+  if [[ -n "${ACME_REQUESTED_SERVICES[*]:-}" ]]; then
+  for svc in "${ACME_REQUESTED_SERVICES[@]}"; do
+    # service names were validated before stopping them
+    printf 'if systemctl is-active --quiet %s; then\n  printf "%%s\\n" %s >> /run/xray-cert-stopped-services\n  systemctl stop %s\nfi\n' \
+      "$svc" "$svc" "$svc" >> "$CERT_PRE_HOOK"
   done
-  ACME_STOPPED_SERVICES=""
+  fi
+  cat > "$CERT_POST_HOOK" <<'EOF'
+#!/bin/sh
+set -eu
+[ -f /run/xray-cert-stopped-services ] || exit 0
+while IFS= read -r svc; do systemctl start "$svc"; done < /run/xray-cert-stopped-services
+rm -f /run/xray-cert-stopped-services
+EOF
+  chmod 700 "$CERT_PRE_HOOK" "$CERT_POST_HOOK"
+}
+restart_acme_services() {
+  local svc failed=0
+  [[ -n "${ACME_STOPPED_SERVICES[*]:-}" ]] || return 0
+  for svc in "${ACME_STOPPED_SERVICES[@]}"; do
+    systemctl start "$svc" || { warn "服务恢复失败：$svc"; failed=1; }
+  done
+  ACME_STOPPED_SERVICES=()
+  return "$failed"
 }
 
 get_cert() {
-  local domain=$1
-  install_acme
-  mkdir -p "$SSL_DIR"
-  if [[ "${ACME_DNS:-}" == "cloudflare" ]]; then
-    [[ -n "${CF_Token:-}" ]] || die "Cloudflare DNS 验证需要设置 CF_Token"
-    [[ -n "${CF_Zone_ID:-}" ]] || warn "未设置 CF_Zone_ID，acme.sh 将自动解析 Zone"
-    [[ -n "${CF_Account_ID:-}" ]] || warn "未设置 CF_Account_ID，通常可继续，但建议显式提供"
-    msg "申请 TLS 证书：$domain（Cloudflare DNS 验证，不占用 80 端口）"
-    ensure_acme_account letsencrypt
-    if ! CF_Token="${CF_Token}" \
-         CF_Zone_ID="${CF_Zone_ID:-}" \
-         CF_Account_ID="${CF_Account_ID:-}" \
-         "$ACME_SH" --issue --dns dns_cf -d "$domain" \
-           --server letsencrypt --force 2>&1 \
-      && ! ensure_acme_account zerossl \
-      && ! CF_Token="${CF_Token}" \
-         CF_Zone_ID="${CF_Zone_ID:-}" \
-         CF_Account_ID="${CF_Account_ID:-}" \
-         "$ACME_SH" --issue --dns dns_cf -d "$domain" \
-           --server zerossl --force 2>&1; then
-      die "Cloudflare DNS 验证申请证书失败。请确认：1) CF_Token 权限正确 2) 域名在该 Zone 下"
-    fi
-  else
-    local users
-    users=$(port_users 80)
-    if [[ -n "$users" && -z "${ACME_STOP_SERVICES:-}" ]]; then
-      printf '%s\n%s\n' "80 端口已被占用：" "$users" >&2
-      die "证书申请需要临时占用 80 端口。可先停 nginx，或用 ACME_STOP_SERVICES=nginx 让脚本临时停启。"
-    fi
-    stop_acme_services
-    msg "申请 TLS 证书：$domain（Let's Encrypt standalone 模式，需要 80 端口空闲）"
-    ensure_acme_account letsencrypt
-    if ! "$ACME_SH" --issue -d "$domain" --standalone --httpport 80 \
-        --server letsencrypt --force 2>&1 \
-      && ! ensure_acme_account zerossl \
-      && ! "$ACME_SH" --issue -d "$domain" --standalone --httpport 80 \
-         --server zerossl --force 2>&1; then
-      restart_acme_services
-      die "证书申请失败。请确认：1) 域名 DNS A 记录指向本机 2) 80 端口未被占用"
-    fi
-    restart_acme_services
-  fi
-
-  "$ACME_SH" --install-cert -d "$domain" \
-    --key-file        "$SSL_DIR/privkey.pem" \
-    --fullchain-file  "$SSL_DIR/fullchain.pem" \
-    --reloadcmd       "systemctl restart xray" 2>&1 \
-  || die "证书安装失败"
-
-  chmod 755 "$SSL_DIR"
-  chmod 644 "$SSL_DIR/fullchain.pem"
-  chmod 600 "$SSL_DIR/privkey.pem"
-  chown nobody "$SSL_DIR/privkey.pem" 2>/dev/null || true
-  ok "证书申请完成：$domain"
-}
-
-# ─────────────────────────── Config writers (read globals) ───────────────────────────
-_common_outbounds() {
-  cat <<'JSON'
-  "outbounds":[
-    {"tag":"direct","protocol":"freedom","settings":{"domainStrategy":"UseIP"}},
-    {"tag":"block","protocol":"blackhole"}
-  ],
-  "routing":{"domainStrategy":"AsIs","rules":[
-    {"type":"field","ip":["geoip:private"],"outboundTag":"block"},
-    {"type":"field","protocol":["bittorrent"],"outboundTag":"block"}
-  ]}
-JSON
-}
-
-_finalize_config() {
-  chmod 600 "$XRAY_CONFIG"
-  chown nobody "$XRAY_CONFIG" 2>/dev/null || true
-}
-
-write_config_reality() {
-  install -d -m 755 "$XRAY_CONFIG_DIR"
-  cat > "$XRAY_CONFIG" <<JSON
-{
-  "log":{"loglevel":"warning"},
-  "inbounds":[{
-    "listen":"0.0.0.0","port":${PORT},"protocol":"vless",
-    "settings":{"clients":[{"id":"${UUID}","flow":"xtls-rprx-vision"}],"decryption":"none"},
-    "streamSettings":{
-      "network":"tcp","security":"reality",
-      "realitySettings":{
-        "show":false,"dest":"${DEST}:443","xver":0,
-        "serverNames":["${SNI}"],"privateKey":"${PRIVKEY}","shortIds":["${SHORTID}"]
-      }
-    },
-    "sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":true}
-  }],
-$(_common_outbounds)
-}
-JSON
-  _finalize_config
-}
-
-write_config_ws_tls() {
-  local base="${PROTO%%-ws-tls}"
-  local clients
-  case "$base" in
-    vless)  clients='"clients":[{"id":"'"$UUID"'"}],"decryption":"none"' ;;
-    vmess)  clients='"clients":[{"id":"'"$UUID"'","alterId":0}]' ;;
-    trojan) clients='"clients":[{"password":"'"$PASSWORD"'"}]' ;;
+  local domain=$1 email
+  state_tool domain "$domain" >/dev/null
+  email=$(get_acme_email)
+  if ! command -v certbot >/dev/null; then pkg_install certbot; fi
+  local args=(certonly --non-interactive --agree-tos --email "$email" --cert-name "$domain" -d "$domain" --keep-until-expiring)
+  case "${ACME_DNS:-}" in
+    cloudflare)
+      [[ -n "${CF_Token:-}" ]] || die "需要 CF_Token"
+      [[ "$CF_Token" =~ ^[a-zA-Z0-9_-]+$ ]] || die "CF_Token 格式无效"
+      case "$PM" in
+        apt) pkg_install python3-certbot-dns-cloudflare ;;
+        dnf|yum) pkg_install python3-certbot-dns-cloudflare ;;
+        *) die "此系统请手动从发行版安装 certbot-dns-cloudflare；自动 DNS 安装支持 apt/dnf/yum" ;;
+      esac
+      install -d -m 700 /etc/letsencrypt
+      printf 'dns_cloudflare_api_token = %s\n' "$CF_Token" > "$CF_CREDENTIALS"
+      chmod 600 "$CF_CREDENTIALS"
+      args+=(--dns-cloudflare --dns-cloudflare-credentials "$CF_CREDENTIALS" --dns-cloudflare-propagation-seconds 60)
+      ;;
+    '')
+      stop_acme_services
+      write_standalone_hooks
+      ensure_port_free 80
+      args+=(--standalone --http-01-port 80 --pre-hook "$CERT_PRE_HOOK" --post-hook "$CERT_POST_HOOK")
+      ;;
+    *) die "ACME_DNS 只支持 cloudflare 或留空" ;;
   esac
-  install -d -m 755 "$XRAY_CONFIG_DIR"
-  cat > "$XRAY_CONFIG" <<JSON
-{
-  "log":{"loglevel":"warning"},
-  "inbounds":[{
-    "listen":"0.0.0.0","port":${PORT},"protocol":"${base}",
-    "settings":{${clients}},
-    "streamSettings":{
-      "network":"ws","security":"tls",
-      "tlsSettings":{
-        "certificates":[{"certificateFile":"${SSL_DIR}/fullchain.pem","keyFile":"${SSL_DIR}/privkey.pem"}],
-        "minVersion":"1.2"
-      },
-      "wsSettings":{"path":"/${WS_PATH}","headers":{"Host":"${DOMAIN}"}}
-    },
-    "sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":true}
-  }],
-$(_common_outbounds)
-}
-JSON
-  _finalize_config
-}
-
-write_config_grpc_tls() {
-  local base="${PROTO%%-grpc-tls}"
-  local clients
-  case "$base" in
-    vless)  clients='"clients":[{"id":"'"$UUID"'"}],"decryption":"none"' ;;
-    vmess)  clients='"clients":[{"id":"'"$UUID"'","alterId":0}]' ;;
-    trojan) clients='"clients":[{"password":"'"$PASSWORD"'"}]' ;;
-  esac
-  install -d -m 755 "$XRAY_CONFIG_DIR"
-  cat > "$XRAY_CONFIG" <<JSON
-{
-  "log":{"loglevel":"warning"},
-  "inbounds":[{
-    "listen":"0.0.0.0","port":${PORT},"protocol":"${base}",
-    "settings":{${clients}},
-    "streamSettings":{
-      "network":"grpc","security":"tls",
-      "tlsSettings":{
-        "certificates":[{"certificateFile":"${SSL_DIR}/fullchain.pem","keyFile":"${SSL_DIR}/privkey.pem"}],
-        "minVersion":"1.2"
-      },
-      "grpcSettings":{"serviceName":"${GRPC_SVC}"}
-    },
-    "sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":true}
-  }],
-$(_common_outbounds)
-}
-JSON
-  _finalize_config
+  certbot "${args[@]}"
+  restart_acme_services
+  install -d -m 750 -o root -g xray "$SSL_DIR"
+  install -m 640 -o root -g xray "/etc/letsencrypt/live/$domain/privkey.pem" "$SSL_DIR/privkey.pem"
+  install -m 640 -o root -g xray "/etc/letsencrypt/live/$domain/fullchain.pem" "$SSL_DIR/fullchain.pem"
+  install -d -m 755 "$(dirname "$CERT_HOOK")"
+  cat > "$CERT_HOOK" <<EOF
+#!/bin/sh
+set -eu
+[ "\$RENEWED_LINEAGE" = "/etc/letsencrypt/live/$domain" ] || exit 0
+[ -d /usr/local/etc/xray/ssl ] || exit 0
+install -m 640 -o root -g xray "\$RENEWED_LINEAGE/privkey.pem" /usr/local/etc/xray/ssl/privkey.pem
+install -m 640 -o root -g xray "\$RENEWED_LINEAGE/fullchain.pem" /usr/local/etc/xray/ssl/fullchain.pem
+/usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json
+if systemctl is-active --quiet xray; then systemctl restart xray; fi
+EOF
+  chmod 750 "$CERT_HOOK"
+  # Use our own timer so renewal availability does not depend on distro defaults.
+  cat > /etc/systemd/system/xray-cert-renew.service <<EOF
+[Unit]
+Description=Renew Xray TLS certificate with Certbot
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/certbot renew --quiet --cert-name $domain
+EOF
+  cat > /etc/systemd/system/xray-cert-renew.timer <<'EOF'
+[Unit]
+Description=Check Xray TLS certificate renewal daily
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=3600
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now xray-cert-renew.timer
+  ok "证书已安装，自动续期已启用。standalone 续期时需保持 80/tcp 可用。"
 }
 
-write_config_ss_ws_tls() {
-  install -d -m 755 "$XRAY_CONFIG_DIR"
-  cat > "$XRAY_CONFIG" <<JSON
-{
-  "log":{"loglevel":"warning"},
-  "inbounds":[{
-    "listen":"0.0.0.0","port":${PORT},"protocol":"shadowsocks",
-    "settings":{"method":"${SS_METHOD}","password":"${PASSWORD}","network":"tcp,udp"},
-    "streamSettings":{
-      "network":"ws","security":"tls",
-      "tlsSettings":{
-        "certificates":[{"certificateFile":"${SSL_DIR}/fullchain.pem","keyFile":"${SSL_DIR}/privkey.pem"}],
-        "minVersion":"1.2"
-      },
-      "wsSettings":{"path":"/${WS_PATH}","headers":{"Host":"${DOMAIN}"}}
-    }
-  }],
-$(_common_outbounds)
+retire_legacy_acme() {
+  # Match only the old script's exact install paths. Do not execute acme.sh or
+  # its shell configs. Renaming .conf to .conf.removed is upstream's --remove.
+  local domain=$1 root_home
+  root_home=$(getent passwd root | cut -d: -f6)
+  [[ -n "$root_home" ]] || return 0
+  python3 - "$root_home/.acme.sh" "$domain" "$SSL_DIR" <<'PY'
+import pathlib, sys
+root=pathlib.Path(sys.argv[1]); domain=sys.argv[2]; ssl=sys.argv[3]
+for dirname in (domain,domain+'_ecc'):
+    conf=root/dirname/(domain+'.conf')
+    if conf.is_symlink() or not conf.is_file(): continue
+    text=conf.read_text()
+    if ssl+'/privkey.pem' in text and ssl+'/fullchain.pem' in text:
+        removed=conf.with_name(conf.name+'.removed')
+        if removed.exists(): raise ValueError('legacy .removed backup exists; inspect before migrating')
+        conf.rename(removed)
+        print('Disabled legacy acme.sh renewal for '+domain)
+PY
 }
-JSON
-  _finalize_config
+
+port_users() { ss -tlnpH "sport = :$1"; }
+ensure_port_free() {
+  state_tool port "$1" >/dev/null
+  local users
+  users=$(port_users "$1")
+  [[ -z "$users" ]] || die "$1/tcp 已被占用，请选用其他端口或先停止占用服务"
+}
+
+
+# ─────────────────────────── Structured state, config and URI handling ─────
+state_tool() {
+  PROTO="$PROTO" PORT="$PORT" UUID="$UUID" PASSWORD="$PASSWORD" \
+  PRIVKEY="$PRIVKEY" PUBKEY="$PUBKEY" SHORTID="$SHORTID" DEST="$DEST" SNI="$SNI" \
+  DOMAIN="$DOMAIN" WS_PATH="$WS_PATH" GRPC_SVC="$GRPC_SVC" SS_METHOD="$SS_METHOD" \
+  ADDR="$ADDR" NAME="$NAME" SSL_DIR="$SSL_DIR" python3 - "$@" <<'PY'
+import base64, ipaddress, json, os, re, sys
+from urllib.parse import quote
+FIELDS = 'PROTO PORT UUID PASSWORD PRIVKEY PUBKEY SHORTID DEST SNI DOMAIN WS_PATH GRPC_SVC SS_METHOD ADDR NAME'.split()
+PROTOCOLS = ['vless-reality', 'ss-ws-tls'] + [p+'-'+t+'-tls' for p in ('vless','vmess','trojan') for t in ('ws','grpc')]
+def domain(v):
+    if len(v)>253 or '.' not in v or not all(re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?',x) for x in v.split('.')):
+        raise ValueError('invalid domain')
+def port(v):
+    if not re.fullmatch(r'[1-9][0-9]{0,4}',v) or not 1<=int(v)<=65535: raise ValueError('invalid port')
+def validate(d):
+    if set(d)!=set(FIELDS) or not all(isinstance(v,str) for v in d.values()): raise ValueError('invalid metadata fields')
+    for v in d.values():
+        if any(ord(c)<32 or ord(c)==127 for c in v): raise ValueError('control character in metadata')
+    if d['PROTO'] not in PROTOCOLS: raise ValueError('invalid protocol')
+    port(d['PORT'])
+    try: ipaddress.ip_address(d['ADDR'])
+    except ValueError: domain(d['ADDR'])
+    if not 1<=len(d['NAME'])<=256: raise ValueError('invalid name length')
+    if d['PROTO']=='vless-reality':
+        domain(d['DEST']); domain(d['SNI'])
+        for k in ('PRIVKEY','PUBKEY'):
+            if not re.fullmatch(r'[A-Za-z0-9_-]{43}',d[k]) or len(base64.urlsafe_b64decode(d[k]+'='))!=32: raise ValueError('invalid X25519 key')
+        if not re.fullmatch(r'(?:[0-9a-fA-F]{2}){1,8}',d['SHORTID']): raise ValueError('invalid short ID')
+    else:
+        domain(d['DOMAIN'])
+        for k in ('WS_PATH','GRPC_SVC'):
+            if not re.fullmatch(r'[A-Za-z0-9_-]{1,128}',d[k]): raise ValueError('invalid transport path')
+    if d['PROTO'].startswith(('vless','vmess')):
+        if not re.fullmatch(r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}',d['UUID']): raise ValueError('invalid UUID')
+    elif not re.fullmatch(r'[A-Za-z0-9_-]{16,128}',d['PASSWORD']): raise ValueError('invalid password')
+    if d['PROTO']=='ss-ws-tls' and d['SS_METHOD'] not in ('aes-256-gcm','aes-128-gcm','chacha20-poly1305'): raise ValueError('invalid SS method')
+def load(path, config):
+    text=open(path).read()
+    if text.lstrip().startswith('{'): d=json.loads(text)
+    else:
+        # Legacy KEY=value is DATA. Never source/eval it, even during migration.
+        d={k:'' for k in FIELDS}
+        for line in text.splitlines():
+            if not line: continue
+            k,sep,v=line.partition('=')
+            if not sep or k not in FIELDS: raise ValueError('invalid legacy metadata')
+            d[k]=v
+        d['PROTO']=d['PROTO'] or 'vless-reality'
+        if d['PROTO']=='vless-reality' and not d['PRIVKEY']:
+            d['PRIVKEY']=json.load(open(config))['inbounds'][0]['streamSettings']['realitySettings']['privateKey']
+    validate(d); return d
+try:
+    cmd=sys.argv[1]
+    if cmd=='domain': domain(sys.argv[2]); sys.exit(0)
+    if cmd=='port': port(sys.argv[2]); sys.exit(0)
+    if cmd=='release':
+        r=json.load(open(sys.argv[2])); tag=r['tag_name']
+        if r.get('draft') or r.get('prerelease') or not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+',tag): raise ValueError('not a stable release')
+        if tuple(map(int,tag[1:].split('.')))<tuple(map(int,sys.argv[4].split('.'))): raise ValueError('version below security minimum')
+        name='Xray-linux-'+sys.argv[3]+'.zip'
+        a=next(a for a in r['assets'] if a['name']==name)
+        url='https://github.com/XTLS/Xray-core/releases/download/'+tag+'/'+name
+        if a['browser_download_url']!=url or not re.fullmatch(r'sha256:[0-9a-f]{64}',a.get('digest') or ''): raise ValueError('missing trusted release digest')
+        print(tag); print(url); print(a['digest'][7:]); sys.exit(0)
+    if cmd=='load':
+        d=load(sys.argv[2],sys.argv[3])
+        for k in FIELDS: sys.stdout.write(k+'\0'+d[k]+'\0')
+        sys.exit(0)
+    d={k:os.environ[k] for k in FIELDS}; validate(d)
+    if cmd=='validate': sys.exit(0)
+    if cmd=='save': print(json.dumps(d,ensure_ascii=False,indent=2)); sys.exit(0)
+    proto=d['PROTO']; base=proto.split('-')[0]; is_ws='-ws-' in proto
+    if cmd=='config':
+        if proto=='vless-reality':
+            settings={'clients':[{'id':d['UUID'],'flow':'xtls-rprx-vision'}],'decryption':'none'}
+            stream={'network':'raw','security':'reality','realitySettings':{'show':False,'target':d['DEST']+':443','xver':0,'serverNames':[d['SNI']],'privateKey':d['PRIVKEY'],'shortIds':[d['SHORTID']]}}
+        else:
+            settings={'clients':[{'password':d['PASSWORD']}]} if base=='trojan' else {'clients':[{'id':d['UUID']}]}
+            if base=='vless': settings['decryption']='none'
+            if base=='ss': settings={'method':d['SS_METHOD'],'password':d['PASSWORD'],'network':'tcp'}
+            stream={'network':'ws' if is_ws else 'grpc','security':'tls','tlsSettings':{'minVersion':'1.2','alpn':['http/1.1'] if is_ws else ['h2'],'certificates':[{'certificateFile':os.environ['SSL_DIR']+'/fullchain.pem','keyFile':os.environ['SSL_DIR']+'/privkey.pem'}]}}
+            stream['wsSettings' if is_ws else 'grpcSettings']={'path':'/'+d['WS_PATH']} if is_ws else {'serviceName':d['GRPC_SVC']}
+        inbound={'listen':'0.0.0.0','port':int(d['PORT']),'protocol':'shadowsocks' if base=='ss' else base,'settings':settings,'streamSettings':stream,'sniffing':{'enabled':True,'destOverride':['http','tls','quic'],'routeOnly':True}}
+        private=['0.0.0.0/8','10.0.0.0/8','100.64.0.0/10','127.0.0.0/8','169.254.0.0/16','172.16.0.0/12','192.168.0.0/16','224.0.0.0/4','240.0.0.0/4','::/128','::1/128','fc00::/7','fe80::/10','ff00::/8']
+        config={'log':{'loglevel':'warning'},'inbounds':[inbound],'outbounds':[{'tag':'direct','protocol':'freedom','settings':{'domainStrategy':'UseIP'}},{'tag':'block','protocol':'blackhole'}],'routing':{'domainStrategy':'IPOnDemand','rules':[{'type':'field','ip':private,'outboundTag':'block'},{'type':'field','protocol':['bittorrent'],'outboundTag':'block'}]}}
+        print(json.dumps(config,ensure_ascii=False,indent=2)); sys.exit(0)
+    if cmd=='link':
+        enc=lambda v:quote(v,safe='')
+        name=enc(d['NAME']); host=d['ADDR']; host='['+host+']' if ':' in host else host
+        if proto=='vless-reality':
+            print('vless://'+d['UUID']+'@'+host+':'+d['PORT']+'?encryption=none&flow=xtls-rprx-vision&security=reality&sni='+d['SNI']+'&fp=chrome&pbk='+d['PUBKEY']+'&sid='+d['SHORTID']+'&type=tcp&headerType=none#'+name)
+        elif base=='vmess':
+            v={'v':'2','ps':d['NAME'],'add':d['DOMAIN'],'port':d['PORT'],'id':d['UUID'],'aid':'0','scy':'auto','net':'ws' if is_ws else 'grpc','type':'none' if is_ws else 'gun','host':d['DOMAIN'] if is_ws else '', 'path':'/'+d['WS_PATH'] if is_ws else d['GRPC_SVC'],'tls':'tls','sni':d['DOMAIN'],'alpn':'http/1.1' if is_ws else 'h2'}
+            print('vmess://'+base64.b64encode(json.dumps(v,ensure_ascii=False).encode()).decode())
+        elif base=='ss':
+            user=base64.urlsafe_b64encode((d['SS_METHOD']+':'+d['PASSWORD']).encode()).decode().rstrip('=')
+            plugin='v2ray-plugin;mode=websocket;tls;host='+d['DOMAIN']+';path=/'+d['WS_PATH']
+            print('ss://'+user+'@'+d['DOMAIN']+':'+d['PORT']+'?plugin='+enc(plugin)+'#'+name)
+        else:
+            user=d['UUID'] if base=='vless' else d['PASSWORD']
+            query=('encryption=none&' if base=='vless' else '')+'security=tls&sni='+d['DOMAIN']+'&type='+('ws' if is_ws else 'grpc')
+            query+=('&host='+d['DOMAIN']+'&path='+enc('/'+d['WS_PATH'])) if is_ws else '&serviceName='+d['GRPC_SVC']
+            print(base+'://'+user+'@'+d['DOMAIN']+':'+d['PORT']+'?'+query+'#'+name)
+        sys.exit(0)
+    raise ValueError('unknown operation')
+except (ValueError,KeyError,StopIteration,OSError,TypeError) as e:
+    print('Invalid Xray state/input: '+str(e),file=sys.stderr); sys.exit(1)
+PY
 }
 
 _write_current_config() {
-  case "$PROTO" in
-    vless-reality)  write_config_reality ;;
-    ss-ws-tls)      write_config_ss_ws_tls ;;
-    *-ws-tls)       write_config_ws_tls ;;
-    *-grpc-tls)     write_config_grpc_tls ;;
-    *) die "未知协议：$PROTO" ;;
-  esac
+  state_tool validate
+  install -d -m 750 -o root -g xray "$XRAY_CONFIG_DIR"
+  ensure_work
+  state_tool config > "$WORK_DIR/config.json"
+  "$XRAY_BIN" run -test -config "$WORK_DIR/config.json"
+  # Stage in the destination filesystem for atomic replacement.
+  install -m 640 -o root -g xray "$WORK_DIR/config.json" "$XRAY_CONFIG.new"
+  mv -f -- "$XRAY_CONFIG.new" "$XRAY_CONFIG"
 }
-
-# ─────────────────────────── Share link builders (read globals) ───────────────────────────
-_name_enc() { printf '%s' "$NAME" | tr ' ' '_'; }
-
-link_vless_reality() {
-  local host="$ADDR"; [[ "$ADDR" == *:*:* ]] && host="[$ADDR]"
-  printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&headerType=none#%s\n' \
-    "$UUID" "$host" "$PORT" "$SNI" "$PUBKEY" "$SHORTID" "$(_name_enc)"
-}
-
-link_vless_ws() {
-  printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&type=ws&host=%s&path=%%2F%s#%s\n' \
-    "$UUID" "$DOMAIN" "$PORT" "$DOMAIN" "$DOMAIN" "$WS_PATH" "$(_name_enc)"
-}
-
-link_vless_grpc() {
-  printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&type=grpc&serviceName=%s#%s\n' \
-    "$UUID" "$DOMAIN" "$PORT" "$DOMAIN" "$GRPC_SVC" "$(_name_enc)"
-}
-
-_vmess_b64() {
-  local net=$1 extra_key=$2 extra_val=$3
-  local json
-  if [[ "$net" == "ws" ]]; then
-    json=$(printf '{"v":"2","ps":"%s","add":"%s","port":"%s","id":"%s","aid":"0","scy":"auto","net":"ws","type":"none","host":"%s","path":"/%s","tls":"tls","sni":"%s","alpn":"","fp":""}' \
-      "$(_name_enc)" "$DOMAIN" "$PORT" "$UUID" "$DOMAIN" "$WS_PATH" "$DOMAIN")
-  else
-    json=$(printf '{"v":"2","ps":"%s","add":"%s","port":"%s","id":"%s","aid":"0","scy":"auto","net":"grpc","type":"gun","host":"","path":"%s","tls":"tls","sni":"%s","alpn":"","fp":""}' \
-      "$(_name_enc)" "$DOMAIN" "$PORT" "$UUID" "$GRPC_SVC" "$DOMAIN")
-  fi
-  printf 'vmess://%s\n' "$(printf '%s' "$json" | base64 -w 0)"
-}
-
-link_vmess_ws()    { _vmess_b64 ws; }
-link_vmess_grpc()  { _vmess_b64 grpc; }
-
-link_trojan_ws() {
-  printf 'trojan://%s@%s:%s?security=tls&sni=%s&type=ws&host=%s&path=%%2F%s#%s\n' \
-    "$PASSWORD" "$DOMAIN" "$PORT" "$DOMAIN" "$DOMAIN" "$WS_PATH" "$(_name_enc)"
-}
-
-link_trojan_grpc() {
-  printf 'trojan://%s@%s:%s?security=tls&sni=%s&type=grpc&serviceName=%s#%s\n' \
-    "$PASSWORD" "$DOMAIN" "$PORT" "$DOMAIN" "$GRPC_SVC" "$(_name_enc)"
-}
-
-link_ss_ws() {
-  local userinfo; userinfo=$(printf '%s:%s' "$SS_METHOD" "$PASSWORD" | base64 -w 0)
-  # SIP002 URI with v2ray-plugin parameters (semicolons URL-encoded as %3B)
-  local plugin="v2ray-plugin%3Bmode%3Dwebsocket%3Btls%3Bhost%3D${DOMAIN}%3Bpath%3D%2F${WS_PATH}"
-  printf 'ss://%s@%s:%s?plugin=%s#%s\n' "$userinfo" "$DOMAIN" "$PORT" "$plugin" "$(_name_enc)"
-}
-
-_build_link() {
-  case "$PROTO" in
-    vless-reality)   link_vless_reality ;;
-    ss-ws-tls)       link_ss_ws ;;
-    vless-ws-tls)    link_vless_ws ;;
-    vless-grpc-tls)  link_vless_grpc ;;
-    vmess-ws-tls)    link_vmess_ws ;;
-    vmess-grpc-tls)  link_vmess_grpc ;;
-    trojan-ws-tls)   link_trojan_ws ;;
-    trojan-grpc-tls) link_trojan_grpc ;;
-    *)               cat "$XRAY_SHARE_FILE" 2>/dev/null ;;
-  esac
-}
-
-# ─────────────────────────── Meta ───────────────────────────
+_build_link() { state_tool link; }
 save_meta() {
-  install -d -m 755 "$XRAY_CONFIG_DIR"
-  cat > "$XRAY_META_FILE" <<EOF
-PROTO=${PROTO}
-PORT=${PORT}
-UUID=${UUID}
-PASSWORD=${PASSWORD}
-PRIVKEY=${PRIVKEY}
-PUBKEY=${PUBKEY}
-SHORTID=${SHORTID}
-DEST=${DEST}
-SNI=${SNI}
-DOMAIN=${DOMAIN}
-WS_PATH=${WS_PATH}
-GRPC_SVC=${GRPC_SVC}
-SS_METHOD=${SS_METHOD}
-ADDR=${ADDR}
-NAME=${NAME}
-EOF
-  chmod 600 "$XRAY_META_FILE"
+  ensure_work
+  state_tool save > "$WORK_DIR/meta.json"
+  install -m 600 -o root -g root "$WORK_DIR/meta.json" "$XRAY_META_FILE.new"
+  mv -f -- "$XRAY_META_FILE.new" "$XRAY_META_FILE"
 }
-
 _reload_meta() {
-  [[ -r "$XRAY_META_FILE" ]] || die "未找到节点配置，请先执行安装。"
-  # shellcheck disable=SC1090
-  . "$XRAY_META_FILE"
-  [[ -z "${PROTO:-}" ]] && PROTO="vless-reality"
-  # Backward compat: old Reality installs without PRIVKEY
-  if [[ "$PROTO" == "vless-reality" && -z "${PRIVKEY:-}" ]]; then
-    PRIVKEY=$(grep '"privateKey"' "$XRAY_CONFIG" 2>/dev/null \
-              | sed 's/.*"privateKey"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
-    [[ -n "$PRIVKEY" ]] || die "无法读取私钥，配置文件可能损坏"
+  [[ -r "$XRAY_META_FILE" ]] || die "未找到节点信息，请先安装"
+  ensure_work
+  state_tool load "$XRAY_META_FILE" "$XRAY_CONFIG" > "$WORK_DIR/meta.values" || die "节点信息不合法，拒绝加载"
+  local key value
+  while IFS= read -r -d '' key && IFS= read -r -d '' value; do
+    printf -v "$key" '%s' "$value"
+  done < "$WORK_DIR/meta.values"
+}
+prepare_service() {
+  install -d -m 750 -o root -g xray "$XRAY_CONFIG_DIR"
+  chown root:xray "$XRAY_CONFIG"
+  chmod 640 "$XRAY_CONFIG"
+  if [[ -d "$SSL_DIR" ]]; then
+    chown root:xray "$SSL_DIR"; chmod 750 "$SSL_DIR"
+    local f
+    for f in "$SSL_DIR/privkey.pem" "$SSL_DIR/fullchain.pem"; do
+      [[ ! -f "$f" ]] || { chown root:xray "$f"; chmod 640 "$f"; }
+    done
   fi
+  install -d -m 755 /etc/systemd/system/xray.service.d
+  cat > /etc/systemd/system/xray.service.d/99-xray-manager.conf <<'EOF'
+[Service]
+User=xray
+Group=xray
+Environment=GODEBUG=multipathtcp=0
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ReadWritePaths=-/var/log/xray
+CapabilityBoundingSet=
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+UMask=0077
+EOF
+  systemctl daemon-reload
+  runuser -u xray -- "$XRAY_BIN" run -test -config "$XRAY_CONFIG"
+}
+restart_checked() {
+  systemctl restart xray
+  sleep 2
+  systemctl is-active --quiet xray || die "Xray 启动失败，将回滚；请检查日志"
+}
+_apply_changes() {
+  begin_transaction
+  _write_current_config
+  prepare_service
+  restart_checked
+  save_meta
+  state_tool link > "$XRAY_SHARE_FILE"
+  chmod 600 "$XRAY_SHARE_FILE"; chown root:root "$XRAY_SHARE_FILE"
+  commit_transaction
+  ok "配置已验证并生效"
 }
 
-_apply_changes() {
-  _write_current_config
-  save_meta
-  local link; link=$(_build_link)
-  printf '%s\n' "$link" > "$XRAY_SHARE_FILE"; chmod 600 "$XRAY_SHARE_FILE"
-  systemctl restart xray; sleep 1
-  systemctl is-active --quiet xray \
-    && ok "Xray 已重启" \
-    || warn "Xray 重启后未运行，执行 'xr logs' 查看"
-}
 
 # ─────────────────────────── Firewall ───────────────────────────
 open_firewall() {
   local port=$1
-  if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -qi active; then
+  if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -qi '^Status: active'; then
     ufw allow "${port}/tcp" >/dev/null 2>&1 && ok "ufw 已放行 ${port}/tcp"
   fi
   if command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then
@@ -667,7 +747,7 @@ open_firewall() {
 print_result() {
   local link="${1:-}"
   [[ -z "$link" && -r "$XRAY_SHARE_FILE" ]] && link=$(cat "$XRAY_SHARE_FILE")
-  [[ -r "$XRAY_META_FILE" ]] && . "$XRAY_META_FILE" 2>/dev/null || true
+  [[ ! -r "$XRAY_META_FILE" ]] || _reload_meta
 
   echo
   printf '%s══════════════════════════════════════════════════════════════════%s\n' "$G" "$N"
@@ -739,9 +819,9 @@ select_protocol() {
   echo >&2
   printf '%s请选择协议：%s\n' "$B" "$N" >&2
   printf '\n%s  ─── 无需域名 ──────────────────────────────────%s\n' "$D" "$N" >&2
-  printf '  1. VLESS + TCP + Reality    %s← 推荐，最优秀的防封锁%s\n' "$G" "$N" >&2
+  printf '  1. VLESS + TCP + Reality    %s← 推荐，推荐使用%s\n' "$G" "$N" >&2
   printf '\n%s  ─── 需要域名 + 自动申请 TLS 证书 ──────────%s\n' "$D" "$N" >&2
-  printf '  2. Shadowsocks + WS + TLS   (SS 隐藏于 HTTPS，防主动探测)\n' >&2
+  printf '  2. Shadowsocks + WS + TLS   (需兼容 v2ray-plugin 的客户端)\n' >&2
   printf '  3. VLESS + WS  + TLS        (CDN 友好)\n' >&2
   printf '  4. VLESS + gRPC + TLS       (CDN 友好，低延迟)\n' >&2
   printf '  5. VMess + WS  + TLS        (兼容性最广)\n' >&2
@@ -776,7 +856,6 @@ _install_reality() {
   DEST="${REALITY_DEST:-$(pick_dest)}"
   SNI="$DEST"
   DOMAIN=""; WS_PATH=""; GRPC_SVC=""; SS_METHOD=""; PASSWORD=""
-  write_config_reality
 }
 
 _install_tls() {
@@ -784,7 +863,7 @@ _install_tls() {
   DOMAIN=$(read_domain_or_die)
   get_cert "$DOMAIN"
 
-  local base="${PROTO%%-${transport}-tls}"
+  local base="${PROTO%%-"${transport}"-tls}"
   if [[ "$base" == "trojan" ]]; then
     PASSWORD=$(gen_password); UUID=""
   else
@@ -794,10 +873,6 @@ _install_tls() {
   GRPC_SVC=$(gen_path)
   PRIVKEY=""; PUBKEY=""; SHORTID=""; DEST=""; SNI=""; SS_METHOD=""
 
-  case "$transport" in
-    ws)   write_config_ws_tls ;;
-    grpc) write_config_grpc_tls ;;
-  esac
 }
 
 _install_ss() {
@@ -822,65 +897,61 @@ _install_ss() {
   [[ -z "$SS_METHOD" ]] && SS_METHOD="aes-256-gcm"
   PASSWORD=$(gen_password)
   WS_PATH=$(gen_path)
-  UUID=""; PRIVKEY=""; PUBKEY=""; SHORTID=""; DEST=""; SNI=""; GRPC_SVC=""
-  write_config_ss_ws_tls
+  UUID=""; PRIVKEY=""; PUBKEY=""; SHORTID=""; DEST=""; SNI=""; GRPC_SVC=$(gen_path)
 }
 
 # ─────────────────────────── Commands ───────────────────────────
 cmd_install() {
   require_root
-  if [[ -s "$XRAY_CONFIG" && -z "${FORCE:-}" ]]; then
-    if [[ -r "$XRAY_META_FILE" ]]; then
-      warn "已存在配置 —— 跳过。如需重建请传 FORCE=1"
-      cmd_info; return
-    fi
-    warn "发现 Xray 配置但缺少节点信息，将继续重建。"
-  fi
   install_deps
-  enable_bbr
-  [[ -x "$XRAY_BIN" ]] || install_xray
-
+  if [[ -s "$XRAY_CONFIG" && "${FORCE:-0}" != 1 ]]; then
+    [[ -r "$XRAY_META_FILE" ]] || die "存在非本脚本管理的配置，拒绝覆盖；请先备份并人工迁移"
+    msg "保留现有节点参数并升级官方核心"
+    cmd_update
+    _self_install
+    cmd_info
+    return
+  fi
   PROTO="${PROTOCOL:-}"
-  [[ -z "$PROTO" ]] && PROTO=$(select_protocol)
-  echo
-
-  # Port
+  [[ -n "$PROTO" ]] || PROTO=$(select_protocol)
   case "$PROTO" in
-    ss-ws-tls|*-ws-tls|*-grpc-tls) PORT="${REALITY_PORT:-443}" ;;
-    *)                              PORT=$(pick_port) ;;
+    vless-reality|ss-ws-tls|vless-ws-tls|vless-grpc-tls|vmess-ws-tls|vmess-grpc-tls|trojan-ws-tls|trojan-grpc-tls) ;;
+    *) die "未知协议：$PROTO" ;;
+  esac
+  case "$PROTO" in
+    *-tls) PORT="${REALITY_PORT:-443}" ;;
+    *) PORT=$(pick_port) ;;
   esac
   ensure_port_free "$PORT"
-
   ADDR="${REALITY_ADDR:-}"
-  if [[ -z "$ADDR" ]]; then
-    ADDR=$(get_public_ip)
-    [[ -z "$ADDR" ]] && { warn "无法自动检测公网 IP"; ADDR="YOUR_SERVER"; }
-  fi
+  [[ -n "$ADDR" ]] || ADDR=$(get_public_ip)
+  [[ -n "$ADDR" ]] || die "无法检测公网 IP，请设置 REALITY_ADDR"
   NAME="${REALITY_NAME:-${PROTO}-${ADDR}}"
-
+  # Validate user controlled fields before any downloads or writes.
+  state_tool port "$PORT"
+  install_xray
   case "$PROTO" in
-    vless-reality)   _install_reality ;;
-    ss-ws-tls)       _install_ss ;;
-    *-ws-tls)        _install_tls "ws" ;;
-    *-grpc-tls)      _install_tls "grpc" ;;
-    *)               die "未知协议：$PROTO" ;;
+    vless-reality) _install_reality ;;
+    ss-ws-tls) _install_ss ;;
+    *-ws-tls) _install_tls ws ;;
+    *-grpc-tls) _install_tls grpc ;;
   esac
-
+  _write_current_config
+  prepare_service
   open_firewall "$PORT"
-  systemctl enable --now xray >/dev/null
-  systemctl restart xray; sleep 1
-  if ! systemctl is-active --quiet xray; then
-    journalctl -u xray -n 30 --no-pager >&2 || true
-    die "Xray 启动失败，请检查上方日志"
-  fi
-  ok "Xray 服务运行中"
-
-  local link; link=$(_build_link)
+  systemctl enable xray >/dev/null
+  restart_checked
   save_meta
-  printf '%s\n' "$link" > "$XRAY_SHARE_FILE"; chmod 600 "$XRAY_SHARE_FILE"
-  _self_install || true
-  print_result "$link"
+  state_tool link > "$XRAY_SHARE_FILE"
+  chmod 600 "$XRAY_SHARE_FILE"; chown root:root "$XRAY_SHARE_FILE"
+  commit_transaction
+  if [[ "$PROTO" != vless-reality ]]; then retire_legacy_acme "$DOMAIN"; fi
+  if [[ "${ENABLE_BBR:-1}" == 1 ]]; then enable_bbr; fi
+  _self_install
+  print_result "$(_build_link)"
 }
+
+
 
 cmd_info() {
   [[ -r "$XRAY_META_FILE" ]] || die "未找到节点配置，请先执行安装。"
@@ -892,11 +963,41 @@ cmd_status()  { systemctl --no-pager --full status xray 2>&1 | sed -n '1,20p'; }
 cmd_logs()    { journalctl -u xray -n "${1:-50}" --no-pager; }
 cmd_restart() {
   require_root
-  systemctl restart xray; sleep 1
-  systemctl is-active --quiet xray && ok "Xray 已重启" || warn "重启失败，执行 'xr logs' 查看"
+  "$XRAY_BIN" run -test -config "$XRAY_CONFIG"
+  restart_checked
+  ok "Xray 已重启"
 }
 cmd_update() {
-  require_root; install_xray; systemctl restart xray; ok "Xray 已升级并重启"
+  require_root
+  install_deps
+  [[ -r "$XRAY_META_FILE" ]] || die "只升级本脚本管理的节点；缺少节点信息，拒绝更改"
+  _reload_meta
+  install_xray
+  # Existing UUID, password and REALITY keys are retained; only config schema changes.
+  _write_current_config
+  prepare_service
+  restart_checked
+  save_meta
+  state_tool link > "$XRAY_SHARE_FILE"
+  chmod 600 "$XRAY_SHARE_FILE"; chown root:root "$XRAY_SHARE_FILE"
+  commit_transaction
+  ok "官方核心已升级，节点参数保留"
+  if [[ "$PROTO" != vless-reality && ! -f "$CERT_HOOK" ]]; then
+    warn "旧 TLS 节点的续期方式尚未迁移；请带 ACME_EMAIL（DNS 模式另带 CF_Token）执行 xr migrate-cert"
+  fi
+}
+cmd_migrate_cert() {
+  require_root
+  install_deps
+  _reload_meta
+  [[ "$PROTO" != vless-reality ]] || die "Reality 不需要证书迁移"
+  begin_transaction
+  get_cert "$DOMAIN"
+  prepare_service
+  restart_checked
+  commit_transaction
+  retire_legacy_acme "$DOMAIN"
+  ok "证书已迁移至发行版 Certbot；旧 acme.sh 若用于其他域名，请继续独立维护"
 }
 cmd_enable_bbr() {
   require_root
@@ -911,6 +1012,7 @@ cmd_delete_node() {
   systemctl stop xray >/dev/null 2>&1 || true
   rm -f "$XRAY_CONFIG" "$XRAY_META_FILE" "$XRAY_SHARE_FILE"
   rm -f "$SSL_DIR/privkey.pem" "$SSL_DIR/fullchain.pem"
+  remove_cert_automation
   rmdir "$SSL_DIR" 2>/dev/null || true
   ok "当前节点已删除，Xray 程序仍保留"
 }
@@ -929,7 +1031,9 @@ cmd_edit_port() {
   printf "当前端口：${Y}%s${N}\n" "$PORT"
   local new; read -r -p "新端口（留空取消）: " new
   [[ -z "$new" ]] && { msg "已取消"; return; }
-  [[ "$new" =~ ^[0-9]+$ ]] && (( new >= 1 && new <= 65535 )) || die "端口须为 1-65535"
+  state_tool port "$new" || die "端口须为 1-65535（不含前导零）"
+  [[ "$new" == "$PORT" ]] && { msg "端口未变化"; return; }
+  ensure_port_free "$new"
   PORT="$new"; open_firewall "$PORT"; _apply_changes
   ok "端口已更新为 ${Y}$PORT${N}"
 }
@@ -968,6 +1072,7 @@ cmd_edit_dest() {
     new_dest="$choice"
   fi
   [[ -z "$new_dest" ]] && { msg "已取消"; return; }
+  state_tool domain "$new_dest"
   DEST="$new_dest"; SNI="$new_dest"; _apply_changes
   ok "伪装目标已更新为 ${Y}$DEST${N}"
 }
@@ -991,17 +1096,15 @@ cmd_menu() {
     echo
 
     if [[ -r "$XRAY_META_FILE" ]]; then
-      # shellcheck disable=SC1090
-      . "$XRAY_META_FILE" 2>/dev/null || true
+      _reload_meta
       local svc_str
       systemctl is-active --quiet xray 2>/dev/null \
         && svc_str="${G}● 运行中${N}" || svc_str="${R}● 已停止${N}"
-      local id_display="${UUID:-${PASSWORD:-—}}"
       printf "  协议：${Y}%-20s${N}  端口：${Y}%s${N}\n" "${PROTO:-—}" "${PORT:-—}"
       local loc_display="${DOMAIN:-${ADDR:-—}}"
       printf "  地址：${Y}%-20s${N}  状态：%b\n" "$loc_display" "$svc_str"
     else
-      printf "  ${Y}未检测到节点配置，请先执行安装${N}\n"
+      printf '  %s未检测到节点配置，请先执行安装%s\n' "$Y" "$N"
     fi
 
     echo
@@ -1070,7 +1173,7 @@ usage() {
 ${B}${SCRIPT_NAME} v${SCRIPT_VERSION}${N}  —  多协议 Xray 一键脚本
 
 支持协议:
-  VLESS+Reality  SS/VLESS/VMess/Trojan + WS/gRPC + TLS（SS 走 WS+TLS 防主动探测）
+  VLESS+Reality  SS/VLESS/VMess/Trojan + WS/gRPC + TLS（SS 需客户端插件）
 
 用法 (首次安装):
   bash $0 [install]   交互式选择协议并安装（默认）
@@ -1085,6 +1188,7 @@ ${B}${SCRIPT_NAME} v${SCRIPT_VERSION}${N}  —  多协议 Xray 一键脚本
   xr enable-bbr    启用 BBR
   xr restart       重启 Xray
   xr update        升级 Xray
+  xr migrate-cert  将旧 TLS 节点证书续期迁移到 Certbot
   xr delete-node   删除当前节点配置
   xr uninstall     卸载 Xray
   xr edit-port     修改端口
@@ -1101,8 +1205,8 @@ ${B}${SCRIPT_NAME} v${SCRIPT_VERSION}${N}  —  多协议 Xray 一键脚本
   REALITY_NAME=MyNode    节点名称
   XRAY_DOMAIN=my.domain  TLS 协议域名
   XRAY_SS_METHOD=…       Shadowsocks 加密方式
-  XRAY_VERSION=v26.3.27  固定 Xray 版本
-  XRAY_INSTALLER_SHA256= 钉住官方安装脚本 SHA256
+  XRAY_VERSION=v26.10.31  固定 Xray 版本
+  ENABLE_BBR=0            不修改系统拥塞控制
   FORCE=1                已有配置时强制重建
 
 系统优化:
@@ -1113,6 +1217,9 @@ EOF
 main() {
   local default_cmd="install"
   [[ "$(basename "${0:-}")" == "xr" ]] && default_cmd="menu"
+  case "${1:-$default_cmd}" in help|-h|--help) usage; return;; esac
+  require_root
+  preflight
   case "${1:-$default_cmd}" in
     menu)             cmd_menu ;;
     install)          cmd_install ;;
@@ -1123,6 +1230,7 @@ main() {
     enable-bbr)       cmd_enable_bbr ;;
     restart)          cmd_restart ;;
     update|upgrade)   cmd_update ;;
+    migrate-cert)     cmd_migrate_cert ;;
     delete-node)      cmd_delete_node ;;
     uninstall|remove) cmd_uninstall ;;
     edit-port)        cmd_edit_port ;;
@@ -1134,4 +1242,5 @@ main() {
     *) usage; exit 1 ;;
   esac
 }
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi
+
