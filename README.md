@@ -28,8 +28,8 @@
 ```bash
 XR_TMP=$(mktemp -d)
 curl -q --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
-  https://raw.githubusercontent.com/lgfyxx1/xray/main/xray-reality.sh -o "$XR_TMP/xr.sh"
-sudo bash "$XR_TMP/xr.sh" install
+  https://raw.githubusercontent.com/lgfyxx1/xray/main/xray-reality.sh -o "$XR_TMP/xr.sh" &&
+  sudo bash "$XR_TMP/xr.sh" install
 rm -rf "$XR_TMP"
 ```
 
@@ -61,11 +61,12 @@ sudo env PROTOCOL=vless-ws-tls XRAY_DOMAIN=node.example.com \
 Cloudflare DNS 验证不占用 80 端口。使用仅对目标 Zone 有 DNS 编辑/读取权限的 Token，避免保存到 shell 历史：
 
 ```bash
-read -rs -p 'Cloudflare API Token: ' XR_CF_TOKEN; echo
-sudo env PROTOCOL=vless-ws-tls XRAY_DOMAIN=node.example.com \
-  ACME_EMAIL=you@example.com ACME_DNS=cloudflare CF_Token="$XR_CF_TOKEN" \
+read -rs -p 'Cloudflare API Token: ' CF_Token; echo
+export CF_Token
+sudo --preserve-env=CF_Token env PROTOCOL=vless-ws-tls XRAY_DOMAIN=node.example.com \
+  ACME_EMAIL=you@example.com ACME_DNS=cloudflare \
   bash "$XR_TMP/xr.sh" install
-unset XR_CF_TOKEN
+unset CF_Token
 ```
 
 DNS 插件自动安装支持已配置 apt/dnf/yum 软件源；包缺失则失败，不添加未知源。CF_Zone_ID/CF_Account_ID 不再需要。Token 位于 root 600 的 /etc/letsencrypt/xray-cloudflare.ini；节点配置/证书为 root:xray 640，服务用户不能修改。
