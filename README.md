@@ -1,118 +1,141 @@
-# xray-reality
+# Xray 节点安装与管理
 
-多协议 Xray 一键部署脚本，底层调用 [XTLS/Xray-install](https://github.com/XTLS/Xray-install) 官方安装器。
+基于 [XTLS/Xray-core](https://github.com/XTLS/Xray-core) 和未修改的 [官方 Xray-install](https://github.com/XTLS/Xray-install)。本仓库提供协议配置、证书、分享链接和管理菜单。
 
-脚本安装时会尝试启用 Linux `BBR` 拥塞控制；如果当前内核不支持，会自动跳过。
+**v3.0.0 安全更新：** 修复 root 元数据命令注入、安装器验证、服务权限、证书安装和失败回滚。详见 [SECURITY.md](SECURITY.md)。截至 2026-11-06，官方最新稳定版为 **v26.10.31**；安装时实时查询官方最新稳定版，不允许低于这一安全基线。
 
-## 支持协议
+## 系统与协议
 
-| # | 协议 | 是否需要域名 | 特点 |
-|---|---|---|---|
-| 1 | VLESS + TCP + Reality | ❌ | **推荐**，最优秀的防封锁 |
-| 2 | Shadowsocks + WS + TLS | ✅ | SS 隐藏于 HTTPS，防主动探测 |
-| 3 | VLESS + WS + TLS | ✅ | CDN 友好 |
-| 4 | VLESS + gRPC + TLS | ✅ | CDN 友好，低延迟 |
-| 5 | VMess + WS + TLS | ✅ | 兼容性最广 |
-| 6 | VMess + gRPC + TLS | ✅ | |
-| 7 | Trojan + WS + TLS | ✅ | |
-| 8 | Trojan + gRPC + TLS | ✅ | |
+支持 systemd、Bash 4+、Python 3 的现代 Linux，架构 x86_64 / aarch64。优先 Debian 12+、Ubuntu 22.04+；兼容提供对应依赖的 dnf/yum、zypper、pacman 系统。Alpine/OpenRC 和第三方面板不在支持范围。
 
-> 纯明文 Shadowsocks 可被 GFW 主动探测识别。本脚本的 Shadowsocks 强制走 WebSocket+TLS，流量完全融入 HTTPS，无法被区分。
+| 协议 | 自有域名 | 客户端要求 |
+|---|---|---|
+| VLESS + RAW(TCP) + REALITY + Vision | 无需 | 支持 REALITY / Vision，默认推荐 |
+| Shadowsocks + WS + TLS | 需要 | 支持 v2ray-plugin，不能按普通 SS 导入 |
+| VLESS + WS + TLS | 需要 | 支持 WS/TLS |
+| VLESS + gRPC + TLS | 需要 | 支持 gRPC/TLS |
+| VMess + WS + TLS | 需要 | 支持 VMess/WS/TLS |
+| VMess + gRPC + TLS | 需要 | 支持 VMess/gRPC/TLS |
+| Trojan + WS + TLS | 需要 | 支持 Trojan/WS/TLS |
+| Trojan + gRPC + TLS | 需要 | 支持 Trojan/gRPC/TLS |
 
-TLS 协议会自动通过 **acme.sh + Let's Encrypt** 申请证书，需要：
-- 域名 DNS A 记录指向服务器 IP
-- 80 端口空闲（申请证书时临时占用）
-- 如果 80 端口被 nginx 占用，可先停 nginx，或使用 `ACME_STOP_SERVICES=nginx` 让脚本申请证书时临时停启
-- TLS/CDN 协议默认监听 443；如果 nginx 也占用 443，需要先调整或停止 nginx，或改用 Cloudflare 支持的其他 HTTPS 端口
-- 如果域名托管在 Cloudflare，推荐使用 `ACME_DNS=cloudflare` 改走 DNS 验证，不占用 80 端口
+本次保留原八种协议。WS/gRPC 仍受官方核心支持，但上游已提示逐步采用 XHTTP。客户端/CDN 须支持对应传输和端口；TLS 不保证流量不可识别。默认监听 IPv4，IPv6 专用主机需自行调整 listen 和防火墙。
 
-## 一键安装
+## 安装与旧节点升级
+
+下载到私有临时目录，查看脚本后用 root 执行：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/lgfyxx1/xray/main/xray-reality.sh -o /tmp/xr.sh && sudo bash /tmp/xr.sh
+XR_TMP=$(mktemp -d)
+curl -q --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+  https://raw.githubusercontent.com/lgfyxx1/xray/main/xray-reality.sh -o "$XR_TMP/xr.sh"
+sudo bash "$XR_TMP/xr.sh" install
+rm -rf "$XR_TMP"
 ```
 
-Cloudflare DNS 验证示例：
+首次安装显示协议菜单；已有本脚本节点会升级官方核心，保留原参数，并安装新版 xr。缺少本脚本元数据的配置会拒绝覆盖。不要用 FORCE=1 做普通升级。仓库更新不会自动改变运行中的 VPS，须在对应服务器执行上述步骤。
+
+升级会重启节点。SSH 若经过该节点，请用独立 SSH 或云控制台执行。先备份 /usr/local/etc/xray，尤其是手工改过配置的节点；新配置会按本工具参数重建，手工字段不会保留。
+
+安装器固定官方提交并强制验证 SHA256；核心只接受官方稳定 Release，强制验证其 SHA256，再交给官方安装器部署。不执行远程 shell 管道，不回退到未校验文件。
+
+## 新建节点
+
+以下示例先按上面的方式下载脚本，在删除临时目录前执行：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/lgfyxx1/xray/main/xray-reality.sh -o /tmp/xr.sh
-ACME_EMAIL=you@example.com CF_Token=your_cloudflare_api_token ACME_DNS=cloudflare REALITY_PORT=8443 FORCE=1 bash /tmp/xr.sh
+sudo env PROTOCOL=vless-reality REALITY_PORT=443 \
+  REALITY_DEST=www.microsoft.com REALITY_NAME=MyNode \
+  bash "$XR_TMP/xr.sh" install
 ```
 
-安装时会弹出协议选择菜单。
+REALITY 目标须适合该协议。默认会测量候选目标的 TLS 连接时间，仍需用实际客户端测试。未设置 REALITY_ADDR 时通过第三方公网 IP 服务探测；可显式设置避免探测。自行在云安全组开放节点 TCP 端口。
 
-> `bash <(curl ...)` 写法依赖 `/dev/fd`，部分 VPS 内核未挂载会报错，请使用上面的写法。
-
-## 安装后管理
-
-安装成功后脚本自动复制到 `/usr/local/bin/xr`，输入 `xr` 打开管理菜单：
-
-```
-╔══════════════════════════════════════════════════╗
-║  Xray 管理脚本 v2.0.0                           ║
-╚══════════════════════════════════════════════════╝
-
-  协议：vless-reality         端口：43210
-  地址：1.2.3.4               状态：● 运行中
-
-  ─────── 节点管理 ────────────────────────────
-  1. 查看节点信息 + 二维码
-  2. 修改端口
-  3. 重新生成 UUID
-  4. 修改伪装目标 (SNI)
-  5. 修改节点名称
-
-  ─────── 服务管理 ────────────────────────────
-  6. 重启 Xray
-  7. 查看日志（最近 50 条）
-  8. 查看服务状态
-
-  ─────── 系统操作 ────────────────────────────
-  9. 升级 Xray
-  10. 卸载 Xray
-
-  0. 退出
-```
-
-## 命令速查
+TLS 节点使用发行版 Certbot + Let's Encrypt。standalone 验证要求域名直接指向服务器、80/tcp 可达且签发时空闲；节点端口默认 443：
 
 ```bash
-xr              # 打开交互式管理菜单
-xr info         # 节点信息 + 分享链接 + 二维码
-xr status       # 服务状态
-xr logs [N]     # 最近 N 条日志
-xr bbr          # 查看 BBR 状态
-xr enable-bbr   # 启用 BBR
-xr restart      # 重启
-xr update       # 升级 Xray
-xr delete-node  # 删除当前节点配置，保留 Xray 程序
-xr uninstall    # 卸载
-xr edit-port    # 修改端口
-xr edit-uuid    # 重新生成 UUID / 密码
-xr edit-dest    # 修改伪装目标（仅 Reality）
-xr edit-name    # 修改节点名称
+sudo env PROTOCOL=vless-ws-tls XRAY_DOMAIN=node.example.com \
+  ACME_EMAIL=you@example.com bash "$XR_TMP/xr.sh" install
 ```
 
-## 可选环境变量
+Cloudflare DNS 验证不占用 80 端口。使用仅对目标 Zone 有 DNS 编辑/读取权限的 Token，避免保存到 shell 历史：
 
-| 变量 | 说明 |
+```bash
+read -rs -p 'Cloudflare API Token: ' XR_CF_TOKEN; echo
+sudo env PROTOCOL=vless-ws-tls XRAY_DOMAIN=node.example.com \
+  ACME_EMAIL=you@example.com ACME_DNS=cloudflare CF_Token="$XR_CF_TOKEN" \
+  bash "$XR_TMP/xr.sh" install
+unset XR_CF_TOKEN
+```
+
+DNS 插件自动安装支持已配置 apt/dnf/yum 软件源；包缺失则失败，不添加未知源。CF_Zone_ID/CF_Account_ID 不再需要。Token 位于 root 600 的 /etc/letsencrypt/xray-cloudflare.ini；节点配置/证书为 root:xray 640，服务用户不能修改。
+
+## 旧 TLS 证书续期迁移
+
+先升级核心，再迁移证书：
+
+```bash
+sudo env ACME_EMAIL=you@example.com xr migrate-cert
+# DNS 模式另加 ACME_DNS=cloudflare 和 CF_Token
+```
+
+nginx 占用 80 时可加 ACME_STOP_SERVICES=nginx，签发时临时停止并在退出时恢复；自动续期使用相应 pre/post hooks。每天由 xray-cert-renew.timer 检查本域名，成功后刷新副本，并在节点运行时重启 Xray。
+
+```bash
+sudo systemctl status xray-cert-renew.timer
+sudo certbot renew --cert-name node.example.com --dry-run
+```
+
+旧 acme.sh 的本域名配置在迁移成功后改为 .conf.removed，避免覆盖新证书；其他域名、账户和共享 cron 不自动删除。实际签发/续期依赖公网 DNS 与 CA，CI 不伪造成功。
+
+## 管理命令
+
+| 命令 | 功能 |
 |---|---|
-| `PROTOCOL=vless-reality` | 跳过选择菜单，直接指定协议 |
-| `REALITY_PORT=443` | 端口（TLS 协议默认 443，Reality 默认随机） |
-| `REALITY_DEST=www.apple.com` | Reality 伪装目标 |
-| `REALITY_ADDR=1.2.3.4` | 分享链接服务器地址 |
-| `REALITY_NAME=MyNode` | 节点名称 |
-| `XRAY_DOMAIN=my.domain` | TLS 协议域名 |
-| `XRAY_SS_METHOD=aes-256-gcm` | Shadowsocks 加密方式 |
-| `XRAY_VERSION=v26.3.27` | 固定 Xray 版本 |
-| `ACME_EMAIL=you@example.com` | 必填，acme.sh 注册 ACME 账户使用的真实邮箱 |
-| `ACME_DNS=cloudflare` | 使用 Cloudflare DNS API 做证书验证，不占用 80 端口 |
-| `ACME_STOP_SERVICES=nginx` | 申请证书前临时停止服务，申请后恢复 |
-| `CF_Token=...` | Cloudflare API Token，供 `dns_cf` 验证使用 |
-| `CF_Zone_ID=...` | 可选，Cloudflare Zone ID |
-| `CF_Account_ID=...` | 可选，Cloudflare Account ID |
-| `FORCE=1` | 已有配置时强制重建 |
+| sudo xr | 交互菜单 |
+| sudo xr info | 信息、分享链接、终端二维码 |
+| sudo xr status / sudo xr logs [N] | 状态 / 日志 |
+| sudo xr restart | 检查配置后重启 |
+| sudo xr update | 最新官方稳定核心，保留参数 |
+| sudo xr migrate-cert | 旧 TLS 节点迁移 Certbot 续期 |
+| sudo xr edit-port | 修改端口、检查占用 |
+| sudo xr edit-uuid | 更新 UUID 或密码，须同步客户端 |
+| sudo xr edit-dest | 修改 REALITY 目标/SNI |
+| sudo xr edit-name | 修改名称，支持中文、空格 |
+| sudo xr bbr / sudo xr enable-bbr | 查看 / 启用 BBR |
+| sudo xr delete-node | 确认后删节点，保留核心 |
+| sudo xr uninstall | 确认后用已校验官方安装器卸载 |
 
-## License
+xr update 更新核心；更新管理脚本需重新下载本仓库脚本。默认不安排无人值守核心升级，避免不受控的协议兼容变化和断线。
 
-MIT
+## 环境变量
+
+| 变量 | 用途 |
+|---|---|
+| PROTOCOL | 见 bash xray-reality.sh help 的协议标识 |
+| REALITY_PORT | 1–65535，无前导零；TLS 默认443，REALITY 默认随机 |
+| REALITY_DEST | REALITY 目标域名，目标端口443 |
+| REALITY_ADDR | 分享地址；IPv4、IPv6 或域名 |
+| REALITY_NAME | 节点名称 |
+| XRAY_DOMAIN | TLS 域名 |
+| XRAY_SS_METHOD | aes-256-gcm / aes-128-gcm / chacha20-poly1305 |
+| XRAY_VERSION=v26.10.31 | 固定不低于安全基线的官方稳定版，留空取 latest |
+| ACME_EMAIL | 真实证书联系邮箱 |
+| ACME_DNS=cloudflare | DNS 验证 |
+| CF_Token | Cloudflare API Token |
+| ACME_STOP_SERVICES=nginx | standalone 临时停止服务，逗号分隔 |
+| ENABLE_BBR=0 | 不修改拥塞控制；默认尝试启用已有 BBR |
+| FORCE=1 | 明确重建并更换凭据，不用于普通升级 |
+
+BBR 只用现有内核模块，不装第三方内核。不会自动开启 UFW 或改 SSH；已有活动 UFW/firewalld 会添加节点 TCP 规则，云安全组及 HTTP 验证用80/tcp 需自行放行。
+
+## 验证与许可证
+
+见 [安全审计及测试范围](SECURITY.md)。八种配置均由真实官方核心执行 run -test：
+
+```bash
+XRAY_TEST_BIN=/path/to/verified/official/xray python3 -m unittest discover -s tests -v
+```
+
+MIT。Xray-core、官方安装器、Certbot 分别遵循上游许可证。
+
