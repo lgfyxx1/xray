@@ -22,7 +22,7 @@
 ## 官方基线
 
 - 核心：[v26.10.31](https://github.com/XTLS/Xray-core/releases/tag/v26.10.31)，包含 MPTCP 紧急安全修复；服务器仍需通过发行版更新 Linux 内核。
-- 安装器：[固定提交](https://github.com/XTLS/Xray-install/blob/04e6f3bd9534811ed901a48c47b2c042dd64eb3a/install-release.sh)，SHA256 `9706391b9f8fbad0f2f4bf39197c506d6f519529232fec3c53cf009334f4336e`。
+- 安装器：[固定提交](https://github.com/XTLS/Xray-install/blob/04e6f3bd9534811ed901a48c47b2c042dd64eb3a/install-release.sh)，SHA256 `934ecb26ded1089f849ac238d5170f1159fe4b6ca300d4f1e67730bd41fe58cf`。
 - 核心 ZIP 必须匹配官方 GitHub Release API 的 SHA256，再交给未修改的官方安装器 `--local` 安装。不回退到镜像、测试版或未验证下载。
 - 校验和与文件来自同一 GitHub 信任边界，不代表独立签名或防护上游账户失陷。
 - 不安排无人值守核心升级；升级会重启节点。SSH 若经过该节点，请先准备独立通道。
